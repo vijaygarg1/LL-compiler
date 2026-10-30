@@ -8,7 +8,7 @@ source file compiles to a single Java class that drives the LLP main loop.
 
 ```
 program      ::= "class" ID "{" entry_method aux_method* "}"
-entry_method ::= return_type ID params "{" decls config* stmt_list "}"
+entry_method ::= return_type ID params "{" contract decls config* stmt_list "}"
                  // The entry method: a Java method whose name is
                  // independent of the class name (Java convention favours
                  // a noun class with a verb method, e.g., `class MergeSort
@@ -16,7 +16,7 @@ entry_method ::= return_type ID params "{" decls config* stmt_list "}"
                  // declared explicitly.  The compiler emits a constructor
                  // that runs one-time field setup and the entry method
                  // itself.  External code uses `new Class(args).method(args)`.
-aux_method   ::= return_type ID params "{" stmt_list "}"
+aux_method   ::= return_type ID params "{" contract stmt_list "}"
                  // An auxiliary method declared inside the same class.
                  // Calls in the body to a name matching the entry or an
                  // aux method become method calls (no `new`); other names
@@ -49,10 +49,15 @@ config       ::= "setContainer" "(" container ")" ";"?      (* unkeyed *)
 container    ::= "LinkedList" | "PriorityQueue" | "Deque"
 order        ::= "min" | "max"
 
+contract     ::= (("requires" | "ensures") expr ";")*
+                 // Method pre- and postconditions, written before the body.
+                 // `old(expr)` may appear in `ensures` only.
+
 stmt_list    ::= stmt (";" stmt)* ";"?
 stmt         ::= lhs "=" expr
                | "if" "(" expr ")" "{" stmt_list "}" ("else" "{" stmt_list "}")?
-               | "while" "(" expr ")" "{" stmt_list "}"
+               | "while" "(" expr ")" "{" ("invariant" expr ";")* stmt_list "}"
+                                                             // loop invariants lead the body
                | "forall" ID "in" range ":" stmt             // single-stmt body
                | type ID (":=" expr)?                        // local decl
                | ID "(" (expr ("," expr)*)? ")"              // program call (ID uppercase)
@@ -581,6 +586,84 @@ Boolean operators use Java spelling: `&&`, `||`, `!`. The older forms
   error naming both members. `mode`, `base`, `process_index`, and the other
   process-wide settings must likewise agree wherever more than one member
   sets them. See `merge_union_programs` in `llc.py`.
+
+## Contracts: `requires`, `ensures`, `invariant`, `old`
+
+A method may state what it assumes and what it guarantees, and a `while` loop
+may state what it maintains. All four forms are **checking aids, not proof
+obligations**: the compiler lowers each to a Java `assert` and does not try to
+verify it. They replace prose assumptions with something a test run can catch.
+
+**`requires EXPR;`** — a precondition, written before the body. It is checked
+on entry, before anything else runs.
+
+**`ensures EXPR;`** — a postcondition, also written before the body (next to
+the `requires`, where a reader looks for the contract). It is checked just
+before the method returns, and so may mention locals the body introduces —
+including the returned array:
+
+```
+int[] merge(int[] B, int[] C) {
+  requires forall i in [0..B.length-2] : B[i] <= B[i+1];
+  requires forall i in [0..C.length-2] : C[i] <= C[i+1];
+  ensures  forall k in [0..D.length-2] : D[k] <= D[k+1];
+  int[] D = new int[B.length + C.length];
+  ...
+  return D;
+}
+```
+
+Both inputs sorted, output sorted — the merge step's whole specification, in
+three lines that run.
+
+**`invariant EXPR;`** — a loop invariant, written as the first statement of a
+`while` body. It is checked once before the loop and again at the end of every
+iteration:
+
+```
+while (lo <= hi) {
+  invariant lo >= 1 && hi <= j - 1;
+  int mid = (lo + hi) / 2;
+  ...
+}
+```
+
+**`old(EXPR)`** — inside `ensures` only, the value `EXPR` had **on entry**. The
+compiler snapshots it into a `final` local at the top of the method, so a
+postcondition can relate the final state to the initial one:
+
+```
+void relax(int comp, int e, int[] W, double[] dist, int[] mwe) {
+  ensures dist[comp] <= old(dist[comp]);   // relaxation never raises a distance
+  ...
+}
+```
+
+`old` is rejected in `requires` (nothing has run yet for it to refer to) and in
+`invariant` (which is rechecked every iteration, so there is no single entry
+state for it to mean). Both produce a compile error naming the clause.
+
+### How they are checked
+
+A quantified contract becomes a loop with a flag and an early `break`, so a
+violation is found at the first offending index rather than scanning on:
+
+```java
+boolean t1 = true;
+for (int i = 0; i <= (B.length - 2); i++) {
+  if (!((B[i] <= B[(i + 1)]))) { t1 = false; break; }
+}
+assert (t1);
+```
+
+Two consequences worth knowing:
+
+- **Java disables assertions unless you ask for them.** Run with `java -ea` or
+  the contracts are dead weight — the class still runs, silently unchecked.
+- **Contracts are Java-only.** `llcpy.py`, `llcjs.py` and `llpp.py` ignore them,
+  so the Python, JavaScript and LaTeX renderings of a program carry no checks.
+  A contract is for testing the Java implementation, not part of the algorithm
+  the book prints.
 
 ## Mapping to Java (default skeleton)
 
