@@ -38,12 +38,15 @@ type         ::= base_type ("[" "]")*
                | "set" "<" base_type ">" ("[" "]")?
 base_type    ::= "int" | "double" | "boolean"
 
-config       ::= "setMode"     "(" mode_kind ")" ";"?      (* omit for the default *)
-               | "setPriority" "(" expr "," order ")" ";"?  (* PriorityQueue mode *)
+config       ::= "setContainer" "(" container ")" ";"?      (* unkeyed *)
+               | "setContainer" "(" "PriorityQueue" "," expr "," order ")" ";"?
+                                                           (* keyed; omit for the default *)
+               | "setPriority" "(" expr "," order ")" ";"?  (* schedules forbidden indices *)
+               | "setAcyclic"  "(" ID ")" ";"?              (* valid input: this graph has no cycle *)
                | "setBase"     "(" ("0" | "1") ")" ";"?     (* index base *)
                | "setProcess"  "(" ID ")" ";"?              (* index of `upon` rules *)
                | "setProcessName" "(" ID ")" ";"?           (* peer name in the figure *)
-mode_kind    ::= "LinkedList" | "PriorityQueue"
+container    ::= "LinkedList" | "PriorityQueue" | "Deque"
 order        ::= "min" | "max"
 
 stmt_list    ::= stmt (";" stmt)* ";"?
@@ -62,8 +65,11 @@ compose_op   ::= "[]"     // parallel (Dijkstra-style; existing)
                | "<>"     // feedback
                | "sync"   // synchronous (contextual keyword)
                | "{" stmt_list ";"? "}"                      // explicit block
+               | lhs "[" expr ".." expr "]" "=" expr        (* slice assignment *)
                | "swap" "(" expr "," expr ")"
-               | "return" expr                               // early exit + result marker (operand required)
+               | "return" expr?                              // early exit + result marker
+                                                             // (bare `return;` only in a void method)
+               | "break"                                     // leave the innermost loop
                | "forbidden" "(" ID ")" ":" expr "=>" "advance" ":" stmt
                                                              // guarded command
                | "ensure" "(" ID ")" ":" lhs cmp_op expr ";"?
@@ -105,6 +111,7 @@ mul_op       ::= "*" | "/" | "%"
 primary      ::= INT | REAL | "true" | "false" | "infinity"
                | ID
                | ID "[" expr "]"
+               | ID "[" expr ".." expr "]"                  (* slice: a[lo..hi] *)
                | ID "(" (expr ("," expr)*)? ")"             (* call *)
                | quantifier ID "in" range ":" expr
                | "(" expr ")"
@@ -113,6 +120,7 @@ primary      ::= INT | REAL | "true" | "false" | "infinity"
                                                             (* member access / method call *)
                | primary "." ID "[" expr "]"                (* indexed record field *)
 quantifier   ::= "min" | "max" | "sum" | "count"           (* contextual *)
+               | "argmin" | "argmax"                       (* contextual *)
                | "map" | "filter"                          (* contextual *)
                | "exists" | "forall"                       (* reserved *)
 ```
@@ -131,10 +139,124 @@ the one position where it can occur, after a `receive` pattern.
 Boolean operators are Java spellings only: `&&`, `||`, `!`. The word forms
 `and`/`or`/`not` are no longer accepted.
 
-The names `min`, `max`, `sum`, `count`, `map`, `filter` are *not* reserved;
+The names `min`, `max`, `sum`, `count`, `argmin`, `argmax`, `map`,
+`filter` are *not* reserved;
 the parser recognises them by text + lookahead (`ID in`) in expression
-position, the same trick used for `setMode`, `setPriority`, `LinkedList`,
-and `PriorityQueue`.
+position, the same trick used for `setContainer`, `LinkedList`, and
+`PriorityQueue`.
+
+### Acyclic inputs
+
+`setAcyclic(A)` states a condition on *valid input*: the predecessor-list
+array `A` has no cycle. Some problems are only defined that way --- a cycle
+has no longest path, so DAG layering has nothing to compute on one --- and
+saying so is what lets the compiler choose a better schedule.
+
+With the promise, forbidden indices are evaluated in topological order:
+the candidate set starts with the indices that have no predecessors, and
+an index is released when its last predecessor has been settled. Every
+index is then advanced at most once, because when its turn comes all of
+its predecessors already hold their final values. That visits each index
+once and each edge once, which is `O(n+m)`.
+
+Without the promise the same program can only relax to a fixpoint,
+revisiting an index every time a predecessor deepens, at `O(n*m)`. For
+LLP-Layering on a chain of 2000 vertices that is the difference between
+0.3 ms and 162 ms.
+
+A cyclic input is a broken promise, so the generated code checks: if some
+index never reaches in-degree zero it throws rather than returning a
+wrong answer quietly.
+
+### Priorities
+
+`setPriority(expr, min|max)` schedules the **forbidden** indices: whenever
+more than one is forbidden, advance the one whose `expr` is least (or
+greatest) first. It cannot change the answer -- the least fixed point does
+not depend on the order in which forbidden indices are advanced -- so it is
+a pure performance hint, and how the order is maintained is the compiler's
+business, not the program's.
+
+That is what separates it from `setContainer`. A priority orders indices
+that are *already known to be forbidden*; a container may also hold indices
+that are not, which is why one is re-tested on removal. The two cannot be
+combined: a container already fixes the order its indices come out in.
+
+How the order is maintained depends on the key. When the priority expression
+reads nothing but the guard's own index variables --- `j` in LLP-LIS and
+LLP-WeightedIntervalScheduling, `j - i` in LLP-OptimalBinarySearchTree ---
+no advance can change it, so the compiler sorts the indices once and then
+sweeps them in that order, repeating the sweep until one passes with nothing
+forbidden. Each index is tested once per sweep, which is what makes
+LLP-WeightedIntervalScheduling's `2(n-1)` guard evaluations and one advance
+per index match the `O(n)` the book claims for it. When the key does read
+program state, as LLP-Layering's `max i in pre[j] : G[i]+1` does, a sorted
+order would go stale, so the compiler falls back to rescanning for the
+extremal forbidden index before each advance. Both lowerings reach the same
+fixed point, since the answer does not depend on the order.
+
+### Containers for candidate indices
+
+`setContainer` names the data structure holding the indices that might be
+forbidden. An unkeyed container takes one argument --- `setContainer(LinkedList)`
+or `setContainer(Deque)`, each with its own fixed order. A `PriorityQueue` is
+keyed and takes three: `setContainer(PriorityQueue, G[j], min)`, giving the
+container, the key, and whether the least or greatest key comes first.
+
+Container, key and order live in one clause on purpose. A container's key
+used to be written as a separate `setPriority` clause, which let a
+`PriorityQueue` be named without a key --- that crashed the compiler ---
+and let a key be given with no container, which was silently ignored.
+Neither is expressible now. `setPriority` remains, but only in its other
+role, as the scheduling hint above. `setMode` has been removed, and naming
+it reports what to write instead.
+
+With `PriorityQueue` the container is a binary heap keyed by the given
+expression. The index it offers is
+already the extremal one, so a guard need not test minimality itself -- the
+container discharges that conjunct, and the guard keeps only the part that
+is cheap to check. Each entry stores the key it had when pushed, so the
+ordering never goes stale; when the advance assigns to `A[k]` and the
+priority is `A[j]`, `k` is pushed again with its new key and the obsolete
+entry is discarded when it surfaces and the guard rejects it. That lazy
+deletion is what removes the need for a decrease-key operation, and it is
+what keeps a program like LLP-Dijkstra at `O(m log n)`.
+
+A `setContainer` clause never changes *which* indices are forbidden, only
+how cheaply the forbidden one is found.
+
+### Slices
+
+`a[lo..hi]` is a **slice**: a fresh array holding `a[lo]` through `a[hi]`,
+**inclusive** of `hi`, matching the `[lo..hi]` convention every range in LL
+already uses. It is a copy, not a view, so writing through the result does
+not disturb `a`. An empty slice (`hi < lo`) is a zero-length array rather
+than an error, the same way an empty quantifier range yields the identity.
+It lowers to `Arrays.copyOfRange`.
+
+`D[lo..hi] = SRC;` is a **slice assignment**: a bulk copy of `hi-lo+1`
+elements into `D` starting at `lo`. `SRC` may itself be a slice (`B[p..q]`,
+which contributes its own start offset) or any array expression (copied
+from index 0). It lowers to `System.arraycopy`, so it is both shorter and
+faster than the element loop it replaces. The destination range fixes the
+length; the source must hold at least that many elements from its offset.
+
+    int[] head = a[0..2];          // first three elements, copied
+    D[k..k+len-1] = B[i..i+len-1]; // move a run of len elements
+
+For *reading*, a quantifier range already does a slice's work -- `sum(t[:j])`
+in Python is `sum i in [0..j-1] : t[i]` here, the same length -- so slices
+earn their keep on bulk data movement: the copy-the-leftover-run step in
+merge-style code, and trimming an over-allocated array to its filled prefix.
+
+`argmin i in [a..b] : E` and `argmax i in [a..b] : E` scan the range like
+`min`/`max` but return the INDEX `i` achieving the extreme value, not the
+value itself, so the result is an `int` whatever `E`'s type. A tie goes to
+the lowest index, and an empty selection -- an empty range, or a `where`
+clause nothing satisfies -- gives `-1`, which is an index no range
+produces. Prefer these to encoding an argmin as
+`min i in R where E == (min i in R : E) : i`, which rescans the range for
+every candidate and so costs a factor of |R| more.
 
 `map i in [a..b] : E` evaluates `E` once per index `i` and returns the
 resulting `int[]` in iteration order. `filter i in [a..b] : P` evaluates
@@ -191,9 +313,18 @@ Boolean operators use Java spelling: `&&`, `||`, `!`. The older forms
   operator; a future `-parallel` flag can refine each one (e.g.,
   `[]` to `ForkJoinTask.invokeAll`, `&&` to a merged-loop runtime,
   etc.) without source edits.
-- **`return X`** is an early exit; the operand is mandatory (no bare
-  `return;`).  The named field `X` is also recorded as the program's
-  result.  For most programs the result is `G`, so write `return G;`.
+- **`break`** leaves the innermost enclosing `while`/`for`/`forall` loop, as
+  in Java. It is a syntax error outside a loop (`line N: \`break\` outside a
+  loop`). Without it, Algorithm InsertionSort and the fractional-knapsack
+  greedy would each have to carry a boolean flag in the loop test instead.
+
+- **`return X`** is an early exit.  The named field `X` is also recorded
+  as the program's result.  For most programs the result is `G`, so write
+  `return G;`.  A bare **`return;`** (no operand) is allowed in a `void`
+  method, where it means "leave this method now" -- so a method whose
+  base cases are uninteresting can use guard clauses instead of wrapping
+  its whole body in an `else` branch.  In a value-returning method a bare
+  `return;` is a compile error.
 - **Constructor vs. method.** The LL `<ret> Name(params) { body }` block
   is compiled into two Java members: a constructor `Name(params)` that
   initialises the shared fields (e.g., `this.G = A.clone()`) and the
@@ -231,14 +362,18 @@ Boolean operators use Java spelling: `&&`, `||`, `!`. The older forms
   `output` field gets two constructors: a top-level one that initialises
   its outputs from `:=` expressions, and a subroutine one that accepts the
   outputs as arguments so recursive calls share a single reference.
-- `setMode(K)` selects the data structure used to track candidate forbidden
-  indices.  The default (omit `setMode`) is a plain `for j = 1..n`
+- `setContainer(...)` selects the data structure used to track candidate
+  forbidden indices.  The default (omit it) is a plain `for j = 1..n`
   re-scan -- suitable when most indices may be forbidden at once
-  (e.g., Bellman-Ford).  Otherwise pick a `java.util` class:
-  - `LinkedList` — a `java.util.LinkedList<Integer>` holding all live
-    indices; the main loop scans for the first forbidden node.
-  - `PriorityQueue` — a `java.util.PriorityQueue<Integer>` keyed by
-    `setPriority(EXPR, ORDER)` where `ORDER` is `min` or `max`.
+  (e.g., Bellman-Ford).  Otherwise name a container:
+  - `setContainer(LinkedList)` — holds all live indices; the main loop
+    scans for the first forbidden node.
+  - `setContainer(Deque)` — polls the front and pushes a non-forbidden
+    index back.
+  - `setContainer(PriorityQueue, EXPR, min|max)` — a binary heap keyed by
+    `EXPR`.  Entries carry the key they were pushed with, and an index is
+    pushed again when the advance changes its key, so no decrease-key is
+    needed; see the Containers section above.
 - **`setProcess(i)`** declares the index at which this program's rules run,
   once, instead of repeating it on every rule. It is the default binder of
   an `upon` written without an index list, so a distributed program reads

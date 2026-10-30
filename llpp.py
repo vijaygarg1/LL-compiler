@@ -58,7 +58,8 @@ def prec(e: Expr) -> int:
     if e.kind == 'un':
         return PREC.get(e.op, 0)
     if e.kind in ('call', 'index', 'index2', 'id', 'int', 'real', 'bool',
-                  'infinity', 'method_call', 'field_access', 'new_array'):
+                  'infinity', 'method_call', 'field_access', 'new_array',
+                  'new_heap'):
         return PREC['atom']
     if e.kind == 'quant':
         return PREC['quant']
@@ -135,15 +136,25 @@ def fmt_quant(e: Expr) -> str:
     else:
         lo = fmt_expr(e.q_lo)
         hi = fmt_expr(e.q_hi)
+    # `where PRED` renders as an extra condition in set-builder form, which is
+    # how the book already writes a restricted minimum -- e.g. LLP-Kruskal's
+    # "min { w[e] | e in E, find(u) != find(v) }". A restricted reduction can
+    # never use the \min_{v=lo}^{hi} subscript form, so it always takes the
+    # braces branch below.
+    where = fmt_expr(e.q_where) if getattr(e, 'q_where', None) is not None else None
+    dom = (v + r' \in ' + rng) if use_set else (v + r' \in [' + lo + r'..' + hi + ']')
+    cond = dom if where is None else dom + r',\; ' + where
     if e.quant == 'min':
-        if use_set:
-            return (r'\min \{' + body + ' \mid ' + v + r' \in ' + rng + r'\}')
+        if use_set or where is not None:
+            return (r'\min \{' + body + r' \mid ' + cond + r'\}')
         return r'\min_{' + v + '=' + lo + '}^{' + hi + r'} ' + paren(e.q_body, PREC['atom'])
     if e.quant == 'max':
-        if use_set:
-            return (r'\max \{' + body + ' \mid ' + v + r' \in ' + rng + r'\}')
+        if use_set or where is not None:
+            return (r'\max \{' + body + r' \mid ' + cond + r'\}')
         return r'\max_{' + v + '=' + lo + '}^{' + hi + r'} ' + paren(e.q_body, PREC['atom'])
     if e.quant == 'sum':
+        if where is not None:
+            return (r'\sum_{' + cond + r'} ' + paren(e.q_body, PREC['atom']))
         if use_set:
             return (r'\sum_{' + v + r' \in ' + rng + r'} ' + paren(e.q_body, PREC['atom']))
         return r'\sum_{' + v + '=' + lo + '}^{' + hi + '} ' + paren(e.q_body, PREC['atom'])
@@ -160,6 +171,12 @@ def fmt_quant(e: Expr) -> str:
         if use_set:
             return r'\forall ' + v + r' \in ' + rng + r' : ' + body
         return (r'\forall ' + v + r' \in [' + lo + r'..' + hi + r'] : ' + body)
+    if e.quant in ('argmin', 'argmax'):
+        op = r'\operatorname*{arg\,min}' if e.quant == 'argmin' else r'\operatorname*{arg\,max}'
+        if use_set or where is not None:
+            return op + r'_{' + cond + r'} ' + paren(e.q_body, PREC['atom'])
+        return (op + r'_{' + v + '=' + lo + '}^{' + hi + r'} '
+                + paren(e.q_body, PREC['atom']))
     if e.quant == 'map':
         if use_set:
             return r'\{\, ' + body + r' \mid ' + v + r' \in ' + rng + r' \,\}'
@@ -199,6 +216,9 @@ def fmt_expr(e: Expr) -> str:
         return fmt_id(e.name)
     if k == 'index':
         return fmt_id(e.name) + '[' + fmt_expr(e.idx) + ']'
+    if k == 'slice':
+        return (fmt_id(e.name) + '[' + fmt_expr(e.slice_lo)
+                + r' \ldots ' + fmt_expr(e.slice_hi) + ']')
     if k == 'index2':
         return (fmt_id(e.name)
                 + '[' + fmt_expr(e.idx) + ']'
@@ -225,6 +245,8 @@ def fmt_expr(e: Expr) -> str:
     if k == 'new_array':
         # `new int[expr]` -> `new \, T[expr]`
         return r'\mathbf{new}\,\mathit{' + e.name + '}[' + fmt_expr(e.idx) + ']'
+    if k == 'new_heap':
+        return r'\mathbf{new}\,\mathit{heap}\langle\mathit{int}\rangle()'
     if k == 'un':
         p = PREC[e.op]
         s = paren(e.lhs, p)
@@ -295,13 +317,20 @@ def stmt_lines(s: Stmt, indent: str = '') -> list:
         else:
             rng = ('[' + fmt_expr(s.loop_lo) + '..' + fmt_expr(s.loop_hi) + ']')
         hdr = '$' + s.loop_var + r' \in ' + rng + '$'
+        # `for` says the iterations are ordered, `forall` that they are
+        # independent -- the same distinction the book draws between \For
+        # and \ForAll.  Both lower to the same sequential loop in code;
+        # only the rendered pseudocode tells them apart.
+        kw = 'For' if getattr(s, 'ordered', False) else 'ForAll'
         one = _loop_inline_body(s.body)
         if one is not None:
             # A loop over a single statement is set on one line, with no rule
             # and no `end` -- the `\l...` form, as a short `if` already is.
-            return [indent + r'\lForAll{' + hdr + '}{' + one + '}']
-        return ([indent + r'\ForAll{' + hdr + '}{']
+            return [indent + '\\l' + kw + '{' + hdr + '}{' + one + '}']
+        return ([indent + '\\' + kw + '{' + hdr + '}{']
                 + body_of(s.body, inner) + [indent + '}'])
+    if s.kind == 'break':
+        return [indent + r'{\bf break}\;']
     if s.kind == 'while':
         return ([indent + r'\While{$' + fmt_expr(s.cond) + '$}{']
                 + body_of(s.body, inner) + [indent + '}'])
@@ -506,13 +535,17 @@ def fmt_stmt(s: Stmt) -> str:
         return ''.join(parts)
     if s.kind == 'forall':
         inner = '; '.join(fmt_stmt(x) for x in s.body)
+        # `for` = ordered iterations, `forall` = independent ones.
+        kw = r'{\bf for} ' if getattr(s, 'ordered', False) else r'{\bf forall} '
         if s.loop_set is not None:
             rng = fmt_set_range(s.loop_set)
-            return (r'{\bf forall} $' + s.loop_var + r' \in ' + rng
+            return (kw + '$' + s.loop_var + r' \in ' + rng
                     + r'$ : ' + inner)
-        return (r'{\bf forall} $' + s.loop_var + r' \in ['
+        return (kw + '$' + s.loop_var + r' \in ['
                 + fmt_expr(s.loop_lo) + r'..' + fmt_expr(s.loop_hi)
                 + r']$ : ' + inner)
+    if s.kind == 'break':
+        return r'{\bf break}'
     if s.kind == 'while':
         inner = '; '.join(fmt_stmt(x) for x in s.body)
         return (r'{\bf while} $(' + fmt_expr(s.cond) + r')$ \{ ' + inner + r' \}')
@@ -545,6 +578,10 @@ def fmt_stmt(s: Stmt) -> str:
         if s.return_value is not None:
             return r'{\bf return} $' + fmt_expr(s.return_value) + r'$'
         return r'{\bf return}'
+    if s.kind == 'slice_assign':
+        src = (fmt_expr(s.rhs) if s.rhs is not None else '')
+        return (fmt_id(s.lhs_name) + '[' + fmt_expr(s.slice_lo)
+                + r' \ldots ' + fmt_expr(s.slice_hi) + r'] := ' + src)
     if s.kind == 'exit':
         return r'{\bf exit}($' + fmt_expr(s.return_value) + r'$)'
     if s.kind == 'send':
@@ -951,9 +988,25 @@ def emit_latex(prog: Program) -> str:
     # Emit the program body stmts.  Guard stmts at the top level use the
     # algorithm2e \Forbidden / \Advance markup for continuity with the book;
     # everything else uses plain fmt_stmt().
-    for s in prog.stmts:
+    # `&&`-joined rules are several guards wearing one statement; print
+    # each of them, so the box shows every rule the program runs.
+    _body = []
+    for _s in prog.stmts:
+        if _s.kind == 'guard' and getattr(_s, 'guard_group', None):
+            _body.extend(_s.guard_group)
+        else:
+            _body.append(_s)
+    for s in _body:
         if s.kind == 'guard':
-            idx_str = ', '.join(s.guard_index)
+            # An index that named its own range prints it, so the box
+            # shows the bound the program actually scans.
+            if getattr(s, 'guard_ranges', None):
+                idx_str = ', '.join(
+                    v if r is None else
+                    f'{v} \in [{fmt_expr(r[0])}..{fmt_expr(r[1])}]'
+                    for v, r in zip(s.guard_index, s.guard_ranges))
+            else:
+                idx_str = ', '.join(s.guard_index)
             # Emit always clauses before the forbidden/ensure line.
             for atype, aname, aexpr in s.guard_always:
                 lines.append(r'\Always{$(' + idx_str + r')$: $'

@@ -53,14 +53,32 @@ from typing import List, Optional, Tuple
 #     text-matched, not reserved -- see _CONFIG_NAMES):
 #       setProcess  setBase  setPriority  setMode  setProcessName
 #       setChannel  setStateful
+#   * Method contracts -- a precondition checked once at entry, and a
+#     postcondition checked before every exit, both lowered to a plain
+#     Java `assert` (so they cost nothing unless the JVM runs with -ea):
+#       requires  ensures
+#     `old(expr)` (text-matched, not reserved -- same reason min/max/
+#     argmin aren't: a program is still free to use `old` as an ordinary
+#     name outside an `ensures` clause) is valid only inside `ensures`,
+#     and refers to expr's value at the method's entry, before its body
+#     ran. See CodeGen._emit_contract_requires/_old_snapshots_for below.
+#   * A `while` loop invariant -- a debugging aid, not a correctness
+#     mechanism meant to run in production: like requires/ensures it
+#     lowers to `assert`, checked once before the loop and again after
+#     every iteration, so a programmer turns it on with -ea while
+#     tracking down a bug and leaves it off (its default state) once
+#     performance matters. `old(...)` is not supported inside it (see
+#     CodeGen._emit_while).
+#       invariant
 KEYWORDS = {
     'class', 'void', 'new',
     'forbidden', 'advance', 'ensure', 'always', 'upon', 'send',
     'receive', 'message', 'enum', 'struct',
-    'if', 'else', 'forall', 'exists', 'while',
+    'if', 'else', 'for', 'forall', 'exists', 'while',
     'true', 'false', 'infinity', 'in', 'pick',
     'int', 'double', 'boolean',
-    'return', 'exit',
+    'return', 'exit', 'break',
+    'requires', 'ensures', 'invariant',
 }
 
 TOKEN_SPEC = [
@@ -146,6 +164,16 @@ class Type:
     is_2d: bool = False   # True for int[][] etc. (2 or more -- see dims)
     is_set: bool = False   # element is set<base>, e.g. set<int>[] for pre(j)
     is_list: bool = False  # list<base>: an ordered, growable sequence
+    is_heap: bool = False
+        # heap<int>: an opaque (key, value) min-priority-queue builtin,
+        # emitted as java.util.PriorityQueue<int[]>. Always scalar (never
+        # arrayed/2D/set/list) and always base='int' -- see java_base_type
+        # and CodeGen._heap_vars. Exists so LLPIntervalPartition.llp and
+        # Dijkstra.llp can reuse a library heap instead of hand-rolling
+        # heapPush/heapPop/heapify, matching the hand-written Python/Rust
+        # companions, which already use heapq/BinaryHeap (chat request:
+        # "the code for Python and Rust are using libraries. Could we not
+        # do that for LL and Java as well").
     range1: Optional[tuple] = None  # (lo_expr, hi_expr) for first dimension
     range2: Optional[tuple] = None  # (lo_expr, hi_expr) for second dimension
     dims: int = 0
@@ -194,12 +222,24 @@ class Stmt:
     cond: Optional['Expr'] = None
     then_stmts: List['Stmt'] = field(default_factory=list)
     else_stmts: List['Stmt'] = field(default_factory=list)
-    # 'forall'
+    # 'forall' / 'for'
+    # ordered=True means the source said `for`: the iterations run in order
+    # and may depend on each other (BubbleSort's adjacent swaps).  False
+    # means `forall`: the iterations are independent, so a parallel backend
+    # is free to run them concurrently.  Both lower to the same sequential
+    # loop today; the distinction is a claim about the program, and it is
+    # what llpp.py renders as \For vs \ForAll.
+    ordered: bool = False
     loop_var: Optional[str] = None
     loop_lo: Optional['Expr'] = None
     loop_hi: Optional['Expr'] = None
     loop_set: Optional['Expr'] = None
     body: List['Stmt'] = field(default_factory=list)
+    # 'while' -- `invariant EXPR;` clauses, written as the leading
+    # statements of the loop body. Checked once before the loop and again
+    # after every iteration (see CodeGen._emit_while); a debugging aid,
+    # not supported with `old(...)`.
+    invariants: List['Expr'] = field(default_factory=list)
     # 'swap'
     swap_a: Optional['Expr'] = None
     swap_b: Optional['Expr'] = None
@@ -216,9 +256,26 @@ class Stmt:
     decl_type: Optional[Type] = None
     decl_name: Optional[str] = None
     decl_init: Optional['Expr'] = None
+    # 'decl' -- the remaining declarators of a multi-name declaration
+    # statement (`int a = 0, b = 1;`), as their own 'decl' statements.
+    # parse_stmt_list splices these in right after this one, so codegen
+    # only ever sees ordinary single-name declarations and no braces are
+    # introduced that would scope the later names away from their uses.
+    decl_siblings: Optional[List['Stmt']] = None
+    # 'slice_assign' -- D[lo..hi] = <array or slice>, a bulk copy of a
+    # whole run of elements. Lowered to System.arraycopy, so it is both
+    # shorter than the element loop it replaces and faster.
+    slice_lo: Optional['Expr'] = None
+    slice_hi: Optional['Expr'] = None
     # 'guard' -- forbidden(j): PRED => advance: STMT
     #            or forbidden(i, j): PRED => advance: STMT  (multi-index)
     guard_index: Optional[List[str]] = None
+    # Optional per-index ranges, parallel to guard_index: an entry is
+    # (lo, hi) for `forbidden (i in [1..n], c in [1..W])`, or None for an
+    # index left to the program-wide default bound.  Without these every
+    # index of a guard shares one bound, which is wrong whenever the
+    # indices range over different things (items vs capacities, say).
+    guard_ranges: Optional[List[Optional[tuple]]] = None
     guard_predicate: Optional['Expr'] = None
     guard_advance: Optional['Stmt'] = None
     guard_pick_var: Optional[str] = None
@@ -230,6 +287,13 @@ class Stmt:
     # `forbidden ... => advance ...` form.  Purely presentational: the
     # node is otherwise identical to a `forbidden`/`advance` guard.
     is_upon: bool = False
+    # Guards joined with `&&` at the statement level: several
+    # forbidden/advance rules that share one fixpoint, so every index is
+    # tested against every rule on each sweep instead of each rule being
+    # driven to its own fixpoint in turn.  Held on the FIRST guard of the
+    # group and listing the whole group (itself included); the others are
+    # absorbed and never emitted as statements of their own.
+    guard_group: Optional[List['Stmt']] = None
     # If the guard was desugared from an `ensure` clause we keep the
     # original parts so the LaTeX printer can render the compact form.
     ensure_lhs_name: Optional[str] = None
@@ -265,6 +329,10 @@ class Expr:
     name: Optional[str] = None        # for 'id', 'index', 'call'
     idx: Optional['Expr'] = None      # for 'index'
     idx2: Optional['Expr'] = None     # for 'new_array' second dimension
+    # 'slice' -- a[lo..hi], an INCLUSIVE sub-range copied out as a new
+    # array, matching the [lo..hi] convention every range in LL uses.
+    slice_lo: Optional['Expr'] = None
+    slice_hi: Optional['Expr'] = None
     idx_extra: List['Expr'] = field(default_factory=list)
         # 3rd+ chained index, e.g. RT[a][b][c][d] (kind stays 'index2'; the
         # first two indices are still idx/idx2, this holds [c, d]) -- or,
@@ -286,6 +354,12 @@ class Expr:
     q_hi: Optional['Expr'] = None
     q_body: Optional['Expr'] = None
     q_set: Optional['Expr'] = None    # if set-valued range: iterate over this int[]
+    q_where: Optional['Expr'] = None  # "where PRED" after the range: restrict the
+                                      # reduction to the indices satisfying PRED.
+                                      # An empty selection yields the identity
+                                      # (min: infinity, max: -infinity, sum/count: 0),
+                                      # which is exactly what the identity-returning
+                                      # helper idiom it replaces used to supply.
     pick_var: Optional[str] = None    # "pick X" after the range; witness capture
 
 
@@ -298,6 +372,12 @@ class Method:
     return_type: Optional['Type']        # None for void
     params: List[Decl] = field(default_factory=list)
     body: List['Stmt'] = field(default_factory=list)
+    # Contracts: `requires EXPR;` / `ensures EXPR;` clauses parsed right
+    # after the method's `{`, before its body.  See CodeGen's
+    # _emit_contract_requires / _emit_aux_method for how these lower to
+    # plain Java `assert`s.
+    requires: List['Expr'] = field(default_factory=list)
+    ensures: List['Expr'] = field(default_factory=list)
 
 
 @dataclass
@@ -306,6 +386,11 @@ class Program:
     params: List[Decl] = field(default_factory=list)  # header: Name(int lo, int[] A)
     decls: List[Decl] = field(default_factory=list)   # var fields only
     mode: str = 'array'
+    # `requires acyclic(A)`: the program is defined only on inputs whose
+    # precedence graph A is acyclic. That is a statement about valid input,
+    # and it is what licenses the compiler to settle each index once in
+    # topological order instead of relaxing to a fixpoint.
+    acyclic_array: Optional[str] = None
     priority_expr: Optional[Expr] = None
     priority_order: str = 'min'
     base: int = 0  # index base: 0 for [0..n-1], 1 for [1..n]
@@ -334,6 +419,12 @@ class Program:
     # locals-only behavior.
     stateful: bool = False
     stmts: List['Stmt'] = field(default_factory=list)  # the program body
+    # Contracts on the entry method: `requires EXPR;` / `ensures EXPR;`
+    # clauses parsed right after its `{`, before decls/config/body. Not
+    # supported together with `ensures` on a guard-bearing (forbidden/
+    # advance) program -- see CodeGen._emit_method's check up front.
+    requires: List['Expr'] = field(default_factory=list)
+    ensures: List['Expr'] = field(default_factory=list)
     # Name of the var that `return X` designates as the program's result.
     # If None the program has no shareable output (no subroutine ctor).
     result_name: Optional[str] = None
@@ -380,6 +471,95 @@ class Program:
     # below, with an empty body. See merge_union_programs() for the exact
     # rules on sharing a field/message/enum by name across members.
     union_members: Optional[List[str]] = None
+
+
+# ============================================================
+#  `always` refresh
+# ============================================================
+# `always : T z = expr` reads as a definition that is continuously true,
+# the way the book states it: wherever `z` appears it means the current
+# value of `expr`.  The emitters bind it once, at the top of forbidden()
+# and advance(), so a statement in the advance body that writes something
+# `expr` depends on leaves `z` stale for the statements after it.
+#
+# LLP-StableMarriage is the case that shows it:
+#     always : int z = mpref[i][G[i]];
+#     advance : { G[i] = G[i] + 1;  ... partner[z] = i; }
+# the advance moves man i to his next choice, so `partner[z] = i` must
+# name the NEW woman; with a single binding at the top it names the old
+# one.  We therefore re-assign `z` after any statement that writes a name
+# the expression reads, which makes the single binding behave like the
+# definition the book writes.  Done on the AST, so the Java, Python and
+# JavaScript emitters all inherit it.
+
+
+def _expr_reads(e, out: set) -> None:
+    """Every identifier name the expression reads."""
+    if e is None or not hasattr(e, 'kind'):
+        return
+    if e.kind in ('id', 'index', 'index2', 'call') and e.name:
+        out.add(e.name)
+    for f in ('idx', 'idx2', 'lhs', 'rhs', 'slice_lo', 'slice_hi',
+              'cond', 'then_expr', 'else_expr', 'quant_lo', 'quant_hi',
+              'quant_set', 'quant_body'):
+        _expr_reads(getattr(e, f, None), out)
+    for f in ('args', 'idx_extra'):
+        for s in getattr(e, f, None) or []:
+            _expr_reads(s, out)
+
+
+def _stmt_writes(st, out: set) -> None:
+    """Every name the statement assigns to, including nested statements."""
+    if st is None or not hasattr(st, 'kind'):
+        return
+    if st.kind == 'assign' and st.lhs_name:
+        out.add(st.lhs_name)
+    if st.kind == 'decl' and st.decl_name:
+        out.add(st.decl_name)
+    if st.kind == 'swap':
+        for side in (st.swap_a, st.swap_b):
+            if side is not None and getattr(side, 'name', None):
+                out.add(side.name)
+    for f in ('body', 'then_stmts', 'else_stmts', 'par_branches'):
+        for s in getattr(st, f, None) or []:
+            _stmt_writes(s, out)
+
+
+def _refresh_always(g) -> None:
+    """Re-assign each `always` variable after a statement that invalidates it."""
+    adv = getattr(g, 'guard_advance', None)
+    if adv is None or not g.guard_always:
+        return
+
+    def walk(stmts: List['Stmt']) -> List['Stmt']:
+        out: List['Stmt'] = []
+        for pos, st in enumerate(stmts):
+            for f in ('body', 'then_stmts', 'else_stmts'):
+                if getattr(st, f, None):
+                    setattr(st, f, walk(getattr(st, f)))
+            out.append(st)
+            if pos == len(stmts) - 1:
+                continue          # nothing after it can read a stale value
+            w: set = set()
+            _stmt_writes(st, w)
+            for atype, aname, aexpr in g.guard_always:
+                if aname in w:
+                    continue      # the statement rebinds it itself
+                r: set = set()
+                _expr_reads(aexpr, r)
+                if not (w & r):
+                    continue
+                nxt = stmts[pos + 1]
+                if (nxt.kind == 'assign' and nxt.lhs_name == aname
+                        and nxt.lhs_index is None):
+                    continue      # already refreshed by hand
+                out.append(Stmt(kind='assign', lhs_name=aname, rhs=aexpr))
+        return out
+
+    if adv.kind == 'block' or getattr(adv, 'body', None):
+        adv.body = walk(list(adv.body))
+    else:
+        g.guard_advance = Stmt(kind='block', body=walk([adv]))
 
 
 # ============================================================
@@ -673,12 +853,21 @@ class Parser:
                     prog.params.append(self._parse_param())
             self.eat('RPAREN')
         self.eat('LBRACE')
-        # field decls at the top of the constructor body.
-        while self._is_field_start():
-            prog.decls.extend(self.parse_decl())
-        # Preamble: optional setMode(...) and setPriority(...) calls.
-        while self._is_config_call():
-            self._parse_config(prog)
+        # Field declarations and the setMode/setPriority/setBase preamble,
+        # in whatever order the program writes them. Two fixed-order passes
+        # cannot take both: LLPPrim declares its arrays before
+        # setContainer, while a setBase(1) program must state the base
+        # first -- and with decls collected first, a leading setBase(1)
+        # left every array a body-local, invisible to the forbidden and
+        # advance helpers that need it.
+        while True:
+            if self._is_field_start():
+                prog.decls.extend(self.parse_decl())
+            elif self._is_config_call():
+                self._parse_config(prog)
+            else:
+                break
+        prog.requires, prog.ensures = self._parse_contract_clauses()
         # The program body is a statement list terminating at `}`.
         if self.peek().kind != 'RBRACE':
             prog.stmts = self.parse_stmt_list()
@@ -722,7 +911,9 @@ class Parser:
                        return_type=first.return_type,
                        entry_name=first.name,
                        params=list(first.params),
-                       stmts=list(first.body))
+                       stmts=list(first.body),
+                       requires=list(first.requires),
+                       ensures=list(first.ensures))
         # Mirror the class-form behaviour: leading top-of-body Decl
         # statements that look like LLP *state-vector* declarations
         # (no init, or a literal / `_i` / scalar fill) are promoted to
@@ -738,56 +929,27 @@ class Parser:
             if init.kind == 'id' and init.name == '_i':
                 return True
             return False
+        # Peel the leading run of state declarations and config calls
+        # TOGETHER, in whatever order the program wrote them. Two separate
+        # passes cannot do it: LLPPrim declares its arrays before
+        # setContainer, while a setBase(1) program must state the base
+        # first, and a fixed order starves one of the two. With the decl
+        # pass first, a leading setBase(1) left every array a method-local
+        # and the forbidden/advance helpers could not see it.
         leading = []
-        while (prog.stmts and prog.stmts[0].kind == 'decl'
-                and _is_field_like(prog.stmts[0].decl_init)):
-            s = prog.stmts.pop(0)
-            leading.append(Decl(kind='var', type=s.decl_type,
-                                name=s.decl_name, init=s.decl_init))
+        while prog.stmts:
+            s0 = prog.stmts[0]
+            if s0.kind == 'decl' and _is_field_like(s0.decl_init):
+                s = prog.stmts.pop(0)
+                leading.append(Decl(kind='var', type=s.decl_type,
+                                    name=s.decl_name, init=s.decl_init))
+                continue
+            if (s0.kind == 'call'
+                    and s0.call_name in self._CONFIG_NAMES):
+                self._apply_config_stmt(prog, prog.stmts.pop(0))
+                continue
+            break
         prog.decls.extend(leading)
-        # Peel any leading `setMode(...)` / `setPriority(...)` config-style
-        # calls and apply them as program-level settings (mirrors the
-        # class-form `_parse_config` path).
-        while (prog.stmts and prog.stmts[0].kind == 'call'
-               and prog.stmts[0].call_name in self._CONFIG_NAMES):
-            s = prog.stmts.pop(0)
-            if s.call_name == 'setMode':
-                if len(s.call_args) != 1 or s.call_args[0].kind != 'id':
-                    raise SyntaxError('setMode argument must be an identifier')
-                arg = s.call_args[0].name
-                if arg not in self._MODE_NAMES:
-                    raise SyntaxError(
-                        f'unknown setMode argument {arg!r}; '
-                        f'expected {sorted(self._MODE_NAMES)}')
-                prog.mode = self._MODE_NAMES[arg]
-            elif s.call_name == 'setPriority':
-                if (len(s.call_args) != 2
-                        or s.call_args[1].kind != 'id'
-                        or s.call_args[1].name not in ('min', 'max')):
-                    raise SyntaxError('setPriority requires (expr, min|max)')
-                prog.priority_expr = s.call_args[0]
-                prog.priority_order = s.call_args[1].name
-            elif s.call_name == 'setProcessName':
-                if len(s.call_args) != 1 or s.call_args[0].kind != 'id':
-                    raise SyntaxError('setProcessName takes one name')
-                prog.process_name = s.call_args[0].name
-            elif s.call_name == 'setProcess':
-                if len(s.call_args) != 1 or s.call_args[0].kind != 'id':
-                    raise SyntaxError('setProcess takes one index name')
-                prog.process_index = s.call_args[0].name
-            elif s.call_name == 'setChannel':
-                if (len(s.call_args) != 1 or s.call_args[0].kind != 'id'
-                        or s.call_args[0].name != 'fifo'):
-                    raise SyntaxError(
-                        "unknown setChannel argument; expected 'fifo' "
-                        "(omit setChannel for the default)")
-                prog.channel = s.call_args[0].name
-            else:  # setBase
-                if (len(s.call_args) != 1
-                        or s.call_args[0].kind != 'int'
-                        or s.call_args[0].value not in (0, 1)):
-                    raise SyntaxError('setBase argument must be 0 or 1')
-                prog.base = s.call_args[0].value
         self._hoist_init_forall(prog)
         while self._is_aux_method_start():
             prog.aux_methods.append(self._parse_aux_method())
@@ -796,6 +958,77 @@ class Parser:
             raise SyntaxError('program has no body statements')
         self._scan_result(prog)
         return prog
+
+
+    def _apply_config_stmt(self, prog: 'Program', s) -> None:
+        """Apply one leading setBase/setContainer/... call as a
+        program-level setting (mirrors the class-form
+        `_parse_config` path)."""
+        if s.call_name == 'setContainer':
+            if not s.call_args or s.call_args[0].kind != 'id':
+                raise SyntaxError(
+                    'setContainer\'s first argument must be a container name')
+            arg = s.call_args[0].name
+            if arg not in self._MODE_NAMES:
+                raise SyntaxError(
+                    f'unknown setContainer container {arg!r}; '
+                    f'expected {sorted(self._MODE_NAMES)}')
+            prog.mode = self._MODE_NAMES[arg]
+            keyed = prog.mode == 'heap'
+            if len(s.call_args) == 3:
+                if not keyed:
+                    raise SyntaxError(
+                        f'setContainer({arg}) takes no key -- a {arg} has '
+                        f'its own fixed order. Only PriorityQueue is keyed.')
+                prog.priority_expr = s.call_args[1]
+                o = s.call_args[2]
+                if o.kind != 'id' or o.name not in ('min', 'max'):
+                    raise SyntaxError(
+                        'setContainer order must be min or max')
+                prog.priority_order = o.name
+            elif len(s.call_args) == 1:
+                if keyed:
+                    raise SyntaxError(
+                        'setContainer(PriorityQueue) needs a key and an '
+                        'order, as in setContainer(PriorityQueue, G[j], min)')
+            else:
+                raise SyntaxError(
+                    'setContainer takes either 1 argument (the container) '
+                    'or 3 (container, key, min|max)')
+        elif s.call_name == 'setPriority':
+            if (len(s.call_args) != 2
+                    or s.call_args[1].kind != 'id'
+                    or s.call_args[1].name not in ('min', 'max')):
+                raise SyntaxError('setPriority requires (expr, min|max)')
+            prog.priority_expr = s.call_args[0]
+            prog.priority_order = s.call_args[1].name
+        elif s.call_name == 'setAcyclic':
+            if len(s.call_args) != 1 or s.call_args[0].kind != 'id':
+                raise SyntaxError(
+                    'setAcyclic takes one name: the predecessor-list '
+                    'array that is guaranteed to be acyclic')
+            prog.acyclic_array = s.call_args[0].name
+        elif s.call_name == 'setProcessName':
+            if len(s.call_args) != 1 or s.call_args[0].kind != 'id':
+                raise SyntaxError('setProcessName takes one name')
+            prog.process_name = s.call_args[0].name
+        elif s.call_name == 'setProcess':
+            if len(s.call_args) != 1 or s.call_args[0].kind != 'id':
+                raise SyntaxError('setProcess takes one index name')
+            prog.process_index = s.call_args[0].name
+        elif s.call_name == 'setChannel':
+            if (len(s.call_args) != 1 or s.call_args[0].kind != 'id'
+                    or s.call_args[0].name != 'fifo'):
+                raise SyntaxError(
+                    "unknown setChannel argument; expected 'fifo' "
+                    "(omit setChannel for the default)")
+            prog.channel = s.call_args[0].name
+        else:  # setBase
+            if (len(s.call_args) != 1
+                    or s.call_args[0].kind != 'int'
+                    or s.call_args[0].value not in (0, 1)):
+                raise SyntaxError('setBase argument must be 0 or 1')
+            prog.base = s.call_args[0].value
 
     def _hoist_init_forall(self, prog: 'Program') -> None:
         """If `prog.stmts` starts with a `forall k in [a..b] : G[k] = X[k]`
@@ -866,13 +1099,61 @@ class Parser:
                 params.append(self._parse_param())
         self.eat('RPAREN')
         self.eat('LBRACE')
+        requires, ensures = self._parse_contract_clauses()
         body: List[Stmt] = []
         if self.peek().kind != 'RBRACE':
             body = self.parse_stmt_list()
         self.accept('SEMI')
         self.eat('RBRACE')
         return Method(name=name, return_type=ret_type,
-                      params=params, body=body)
+                      params=params, body=body,
+                      requires=requires, ensures=ensures)
+
+    def _parse_contract_clauses(self) -> Tuple[List['Expr'], List['Expr']]:
+        """Zero or more `requires EXPR;` / `ensures EXPR;` clauses, in
+        either order, right after a method's `{` and before its first real
+        statement -- the same slot `config*` clauses occupy on the entry
+        method. `old(...)` is rejected inside `requires`: nothing has run
+        yet at that point, so there is no prior state for it to name."""
+        requires: List[Expr] = []
+        ensures: List[Expr] = []
+        while self.peek().kind in ('KW_REQUIRES', 'KW_ENSURES'):
+            is_requires = self.peek().kind == 'KW_REQUIRES'
+            self.eat(self.peek().kind)
+            e = self.parse_expr()
+            self.eat('SEMI')
+            if is_requires:
+                self._reject_old(e, 'requires')
+                requires.append(e)
+            else:
+                ensures.append(e)
+        return requires, ensures
+
+    def _reject_old(self, e: Optional['Expr'], clause: str) -> None:
+        """Raise if `old(...)` occurs anywhere in e. Used for `requires`
+        (no prior state yet for `old` to refer to) and `invariant` (checked
+        on every iteration, not once per call, so there is no single
+        "entry" snapshot for `old` to mean)."""
+        if e is None or not hasattr(e, 'kind'):
+            return
+        if e.kind == 'call' and e.name == 'old':
+            if clause == 'requires':
+                reason = 'nothing has run yet at that point'
+            else:
+                reason = ('it is rechecked every iteration, not once per '
+                          'call, so there is no single entry state for it '
+                          'to mean')
+            raise SyntaxError(
+                f"`old(...)` is not meaningful in `{clause}`: {reason}. "
+                f"Use it only in `ensures`.")
+        for fl in dataclasses.fields(e):
+            v = getattr(e, fl.name, None)
+            if isinstance(v, Expr):
+                self._reject_old(v, clause)
+            elif isinstance(v, list):
+                for x in v:
+                    if isinstance(x, Expr):
+                        self._reject_old(x, clause)
 
     def _scan_result(self, prog: 'Program') -> None:
         """Walk every `return E` (with operand) in the entry-method body.
@@ -928,12 +1209,29 @@ class Parser:
     # The configuration calls recognised in the preamble.  Like `setMode`,
     # they are matched by text rather than reserved, so none of these names
     # is taken away from the programmer.
-    _CONFIG_NAMES = ('setMode', 'setPriority', 'setBase', 'setProcessName',
-                     'setProcess', 'setChannel', 'setStateful')
+    _CONFIG_NAMES = ('setContainer', 'setPriority', 'setBase',
+                     'setProcessName', 'setProcess', 'setChannel',
+                     'setStateful', 'setAcyclic')
+
+    # Retired in favour of setContainer, which carries the container, its key
+    # and the order in one clause.  Keeping them here lets the parser say so
+    # instead of failing later with a confusing error about an unknown call.
+    _RETIRED_CONFIG = {
+        'setMode': 'setContainer(K) -- or setContainer(PriorityQueue, key, min|max)',
+    }
+
+    def _reject_retired_config(self) -> None:
+        tok = self.peek()
+        if (tok.kind == 'ID' and tok.text in self._RETIRED_CONFIG
+                and self.peek(1).kind == 'LPAREN'):
+            raise SyntaxError(
+                f'line {tok.line}: {tok.text} has been removed; write '
+                f'{self._RETIRED_CONFIG[tok.text]} instead')
 
     def _is_config_call(self) -> bool:
         """True if the next tokens look like `setMode(...)` or
         `setPriority(...)` -- i.e., a configuration call in the preamble."""
+        self._reject_retired_config()
         return (self.peek().kind == 'ID'
                 and self.peek().text in self._CONFIG_NAMES
                 and self.peek(1).kind == 'LPAREN')
@@ -950,25 +1248,64 @@ class Parser:
         """Consume a setMode(...) or setPriority(...) preamble call."""
         name = self.eat('ID').text
         self.eat('LPAREN')
-        if name == 'setMode':
+        if name == 'setContainer':
+            # setContainer(K) for an unkeyed structure, or
+            # setContainer(PriorityQueue, key, min|max) for a keyed one. The
+            # key and its order live in the same clause as the container they
+            # belong to, so neither can be supplied without the other -- the
+            # two failure modes of the old separate setPriority clause.
             arg_tok = self.eat('ID')
             if arg_tok.text not in self._MODE_NAMES:
                 raise SyntaxError(
-                    f'line {arg_tok.line}: unknown setMode argument '
+                    f'line {arg_tok.line}: unknown setContainer container '
                     f'{arg_tok.text!r}; expected '
-                    f'{sorted(self._MODE_NAMES)} (omit setMode for the default)')
+                    f'{sorted(self._MODE_NAMES)} '
+                    f'(omit setContainer for the default)')
             prog.mode = self._MODE_NAMES[arg_tok.text]
+            keyed = prog.mode == 'heap'
+            if self.accept('COMMA'):
+                if not keyed:
+                    raise SyntaxError(
+                        f'line {arg_tok.line}: setContainer({arg_tok.text}) '
+                        f'takes no key -- a {arg_tok.text} has its own fixed '
+                        f'order. Only PriorityQueue is keyed.')
+                prog.priority_expr = self.parse_expr()
+                self.eat('COMMA')
+                o_tok = self.eat('ID')
+                if o_tok.text not in ('min', 'max'):
+                    raise SyntaxError(
+                        f'line {o_tok.line}: setContainer order must be '
+                        f'min or max, got {o_tok.text!r}')
+                prog.priority_order = o_tok.text
+            elif keyed:
+                raise SyntaxError(
+                    f'line {arg_tok.line}: setContainer(PriorityQueue) needs '
+                    f'a key and an order, as in '
+                    f'setContainer(PriorityQueue, G[j], min)')
             self.eat('RPAREN')
             self.accept('SEMI')
         elif name == 'setPriority':
+            # setPriority orders the FORBIDDEN indices: among those the guard
+            # currently marks forbidden, advance the least (or greatest) first.
+            # It cannot change the answer -- the least fixed point does not
+            # depend on the order -- so it is a pure scheduling hint, and how
+            # the order is maintained is the compiler's business. That is what
+            # separates it from setContainer, whose structure may also hold
+            # indices that are NOT forbidden and must be tested on removal.
+            if prog.mode != 'array':
+                raise SyntaxError(
+                    f'line {self.peek().line}: setPriority cannot be combined '
+                    f'with setContainer -- a container already fixes the order '
+                    f'its indices come out in')
             prog.priority_expr = self.parse_expr()
             self.eat('COMMA')
             o_tok = self.eat('ID')
             if o_tok.text not in ('min', 'max'):
                 raise SyntaxError(
                     f'line {o_tok.line}: setPriority order must be '
-                    f'`min` or `max`, got {o_tok.text!r}')
+                    f'min or max, got {o_tok.text!r}')
             prog.priority_order = o_tok.text
+            prog.mode = 'priority'
             self.eat('RPAREN')
             self.accept('SEMI')
         elif name == 'setProcessName':
@@ -977,6 +1314,15 @@ class Parser:
             # P_1..P_n, and the figure says so.
             n_tok = self.eat('ID')
             prog.process_name = n_tok.text
+            self.eat('RPAREN')
+            self.accept('SEMI')
+        elif name == 'setAcyclic':
+            # A condition on valid input: the named predecessor-list array
+            # has no cycle. The compiler uses it to settle each index once
+            # in topological order; a cyclic input is rejected at run time
+            # rather than silently answered.
+            a_tok = self.eat('ID')
+            prog.acyclic_array = a_tok.text
             self.eat('RPAREN')
             self.accept('SEMI')
         elif name == 'setProcess':
@@ -1059,7 +1405,12 @@ class Parser:
         if k == 'ID' and (self.peek().text in self.enums
                           or self.peek().text in self.records):
             return True
-        if (k == 'ID' and self.peek().text in ('set', 'list')
+        # `heap<int>` belongs here too: declared at the top of a guard-bearing
+        # body it becomes a field, so the queue survives from one advance to
+        # the next.  Without that a program can only rebuild its heap inside
+        # the advance, which is what keeps LLP-IntervalPartition's naive
+        # formulation above O(n log n).
+        if (k == 'ID' and self.peek().text in ('set', 'list', 'heap')
                 and self.peek(1).kind == 'LT'):
             return True
         # A field whose type names another program -- `DiningPhilosophers
@@ -1137,6 +1488,15 @@ class Parser:
             return Type(base=base_tok.text, is_list=True,
                         is_array=dims >= 1, is_2d=dims >= 2,
                         range1=lranges[0], range2=lranges[1])
+        # "heap" "<" "int" ">" -- an opaque min-priority-queue builtin.
+        # Always scalar: no `[...]` sizing/array suffix (unlike set<int>).
+        if (self.peek().kind == 'ID' and self.peek().text == 'heap'
+                and self.peek(1).kind == 'LT'):
+            self.eat('ID')
+            self.eat('LT')
+            base_tok = self.eat('KW_INT')
+            self.eat('GT')
+            return Type(base=base_tok.text, is_heap=True)
         # "set" "<" base_type ">" ("[" "]")? | base_type ("[" "]")?
         if self.peek().kind == 'ID' and self.peek().text == 'set':
             self.eat('ID')
@@ -1178,15 +1538,42 @@ class Parser:
         return Type(base=base_tok.text, is_array=dims >= 1, is_2d=dims >= 2,
                     dims=dims, range1=ranges[0], range2=ranges[1])
 
+    def _parse_guard_indices(self):
+        """Parse `(j)`, `(i, j)`, or `(i in [lo..hi], c in [lo..hi])`.
+
+        Returns (indices, ranges) with ranges parallel to indices: an
+        (lo, hi) pair where the index named its own bound, else None.
+        Shared by `forbidden` and `ensure` so the two spell an index the
+        same way."""
+        self.eat('LPAREN')
+        indices: List[str] = []
+        ranges: List[Optional[tuple]] = []
+
+        def _one_index():
+            indices.append(self.eat('ID').text)
+            # `i in [lo..hi]` bounds this index on its own; the same
+            # bracket range the quantifiers already use.
+            if self.accept('KW_IN'):
+                self.eat('LBRACK')
+                lo = self.parse_expr()
+                self.eat('DOTDOT')
+                hi = self.parse_expr()
+                self.eat('RBRACK')
+                ranges.append((lo, hi))
+            else:
+                ranges.append(None)
+
+        _one_index()
+        while self.accept('COMMA'):
+            _one_index()
+        self.eat('RPAREN')
+        return indices, ranges
+
     def _parse_guard(self) -> Stmt:
         """forbidden (j) : PRED => advance : STMT
         or forbidden (i, j) : PRED => advance : STMT  (multi-index)
         STMT is a single stmt; multiple must be wrapped in { ... }."""
-        self.eat('LPAREN')
-        indices = [self.eat('ID').text]
-        while self.accept('COMMA'):
-            indices.append(self.eat('ID').text)
-        self.eat('RPAREN')
+        indices, ranges = self._parse_guard_indices()
         self.eat('COLON')
         pred = self.parse_expr()
         self.eat('ARROW')
@@ -1198,34 +1585,43 @@ class Parser:
                 and pred.pick_var is not None):
             pick_var = pred.pick_var
         return Stmt(kind='guard', guard_index=indices, guard_predicate=pred,
+                    guard_ranges=(ranges if any(r is not None for r in ranges)
+                                  else None),
                     guard_advance=adv, guard_pick_var=pick_var)
 
     def _parse_ensure(self) -> Stmt:
         """ensure (j) : LHS op RHS -- desugars to a guard stmt.
         or ensure (i, j) : LHS op RHS  (multi-index)"""
-        self.eat('LPAREN')
-        indices = [self.eat('ID').text]
-        while self.accept('COMMA'):
-            indices.append(self.eat('ID').text)
-        self.eat('RPAREN')
+        indices, ranges = self._parse_guard_indices()
         self.eat('COLON')
         name = self.eat('ID').text
         lhs_idx: Optional[Expr] = None
+        lhs_idx2: Optional[Expr] = None
         if self.accept('LBRACK'):
             lhs_idx = self.parse_expr()
             self.eat('RBRACK')
+            # `ensure (i,j in [..]) : G[i][j] <= ...` -- a two-index ensure,
+            # which LLP-FloydWarshall needs: its G really is a matrix.
+            if self.accept('LBRACK'):
+                lhs_idx2 = self.parse_expr()
+                self.eat('RBRACK')
         op_tok = self.eat('LEQ', 'GEQ', 'LT', 'GT', 'EQEQ')
         op = '=' if op_tok.text == '==' else op_tok.text
         rhs = self.parse_expr()
-        if lhs_idx is not None:
+        if lhs_idx2 is not None:
+            lhs_expr = Expr(kind='index2', name=name, idx=lhs_idx, rhs=lhs_idx2)
+        elif lhs_idx is not None:
             lhs_expr = Expr(kind='index', name=name, idx=lhs_idx)
         else:
             lhs_expr = Expr(kind='id', name=name)
         pred = Expr(kind='un', op='not',
                     lhs=Expr(kind='bin', op=op,
                              lhs=lhs_expr, rhs=rhs))
-        adv = Stmt(kind='assign', lhs_name=name, lhs_index=lhs_idx, rhs=rhs)
+        adv = Stmt(kind='assign', lhs_name=name, lhs_index=lhs_idx,
+                   lhs_index2=lhs_idx2, rhs=rhs)
         return Stmt(kind='guard', guard_index=indices, guard_predicate=pred,
+                    guard_ranges=(ranges if any(r is not None for r in ranges)
+                                  else None),
                     guard_advance=adv, guard_pick_var=None,
                     ensure_lhs_name=name, ensure_lhs_index=lhs_idx,
                     ensure_op=op, ensure_rhs=rhs)
@@ -1415,7 +1811,32 @@ class Parser:
         stmts: List[Stmt] = []
         while self.peek().kind not in self._STMT_TERMINATORS:
             s = self.parse_stmt()
+            # `G1 && G2 && ...` at statement level: one fixpoint shared by
+            # several rules.  Only guards may be joined this way.
+            if s.kind == 'guard' and self.peek().kind == 'ANDAND':
+                group = [s]
+                while self.accept('ANDAND'):
+                    nxt = self.parse_stmt()
+                    if nxt.kind != 'guard':
+                        raise SyntaxError(
+                            f'line {self.peek().line}: `&&` between statements '
+                            f'may only join forbidden/advance (or ensure/upon) '
+                            f'rules; got a {nxt.kind} statement')
+                    group.append(nxt)
+                idx = [tuple(g.guard_index or ['j']) for g in group]
+                if len(set(idx)) != 1:
+                    raise SyntaxError(
+                        f'line {s.guard_line}: rules joined with `&&` must '
+                        f'share the same index variables; got '
+                        + ' and '.join('(' + ', '.join(i) + ')' for i in idx))
+                s.guard_group = group
             stmts.append(s)
+            # `int a = 0, b = 1;` parsed as one statement carrying its later
+            # declarators: splice them in as siblings, so everything
+            # downstream sees plain one-name declarations.
+            if s.kind == 'decl' and s.decl_siblings:
+                stmts.extend(s.decl_siblings)
+                s.decl_siblings = None
             # A braced `upon` also ends in `}`, so its `;` is optional too;
             # a brace-less one is an ordinary statement and requires it.
             braced_upon = (s.is_upon and s.guard_advance is not None
@@ -1442,32 +1863,71 @@ class Parser:
                 self.accept('SEMI')
                 self.eat('RBRACE')
             return Stmt(kind='if', cond=cond, then_stmts=then_s, else_stmts=else_s)
-        if self.accept('KW_FORALL'):
+        # `forall j in RANGE : S` -- independent iterations.
+        # `for    j in RANGE : S` -- ordered iterations.  Same lowering; the
+        # keyword records which claim the program is making.
+        if self.peek().kind in ('KW_FORALL', 'KW_FOR'):
+            ordered = self.accept('KW_FORALL', 'KW_FOR').kind == 'KW_FOR'
             var = self.eat('ID').text
             self.eat('KW_IN')
             lo, hi, setexpr = self.parse_range_or_set()
             self.eat('COLON')
-            body = [self.parse_stmt()]
-            return Stmt(kind='forall', loop_var=var, loop_lo=lo, loop_hi=hi,
-                        loop_set=setexpr, body=body)
+            self._loop_depth = getattr(self, '_loop_depth', 0) + 1
+            try:
+                body = [self.parse_stmt()]
+            finally:
+                self._loop_depth -= 1
+            return Stmt(kind='forall', ordered=ordered, loop_var=var,
+                        loop_lo=lo, loop_hi=hi, loop_set=setexpr, body=body)
+        # `break;` -- leave the innermost enclosing loop, as in Java.
+        # The book writes it in Algorithm InsertionSort and in the
+        # fractional-knapsack greedy; without it both have to carry a
+        # boolean flag in the loop test instead.
+        if self.accept('KW_BREAK'):
+            if getattr(self, '_loop_depth', 0) < 1:
+                t = self.peek()
+                raise SyntaxError(
+                    f'line {t.line}: `break` outside a loop')
+            return Stmt(kind='break')
         # `while (cond) { stmts }` -- Java-style while loop.
         if self.accept('KW_WHILE'):
             self.eat('LPAREN')
             cond = self.parse_expr()
             self.eat('RPAREN')
             self.eat('LBRACE')
-            body = self.parse_stmt_list()
+            # `invariant EXPR;` clauses, leading the body the same way
+            # requires/ensures lead a method body. Checked once before the
+            # loop and again after every iteration (see CodeGen._emit_while)
+            # -- a debugging aid, so `old(...)` (which would need a
+            # per-iteration snapshot, not the once-per-call kind `ensures`
+            # uses) is not supported here.
+            invariants: List[Expr] = []
+            while self.peek().kind == 'KW_INVARIANT':
+                self.eat('KW_INVARIANT')
+                e = self.parse_expr()
+                self.eat('SEMI')
+                self._reject_old(e, 'invariant')
+                invariants.append(e)
+            self._loop_depth = getattr(self, '_loop_depth', 0) + 1
+            try:
+                body = self.parse_stmt_list()
+            finally:
+                self._loop_depth -= 1
             self.accept('SEMI')
             self.eat('RBRACE')
-            return Stmt(kind='while', cond=cond, body=body)
-        # `return X` -- early exit and result marker.  An operand is
-        # mandatory; `return;` (without operand) is rejected at parse time.
+            return Stmt(kind='while', cond=cond, body=body,
+                       invariants=invariants)
+        # `return X` -- early exit and result marker.  A bare `return;` is
+        # also allowed and means "leave this void method now", so a method
+        # whose base cases are uninteresting can use guard clauses instead
+        # of wrapping its whole body in an else-branch.  Whether the
+        # enclosing method is actually void is not known here (the parser
+        # sees statements before it has bound them to a signature), so
+        # CodeGen._emit_stmt rejects a bare return in a value-returning
+        # method, where it would otherwise emit Java that does not compile.
         if self.accept('KW_RETURN'):
             if self.peek().kind in self._STMT_TERMINATORS or self.peek().kind == 'SEMI':
-                t = self.peek()
-                raise SyntaxError(
-                    f'line {t.line}: `return` requires an operand '
-                    f'(e.g. `return G;`)')
+                return Stmt(kind='return', return_value=None)
             val = self.parse_expr()
             return Stmt(kind='return', return_value=val)
         # `exit(EXPR)` -- the algorithm is finished, with that result.  A rule
@@ -1505,6 +1965,7 @@ class Parser:
                     f'line {t.line}: `always` must be followed by '
                     f'`forbidden`, `ensure`, or `upon`')
             g.guard_always = always_clauses
+            _refresh_always(g)
             return g
         # `forbidden (j) : PRED => advance : STMT` -- guarded command.
         if self.accept('KW_FORBIDDEN'):
@@ -1599,7 +2060,7 @@ class Parser:
         # already-declared field/local, not a new declaration.
         if (self.peek().kind in ('KW_INT', 'KW_DOUBLE', 'KW_BOOLEAN')
                 or (self.peek().kind == 'ID'
-                    and self.peek().text in ('set', 'list')
+                    and self.peek().text in ('set', 'list', 'heap')
                     and self.peek(1).kind == 'LT')
                 or (self.peek().kind == 'ID'
                     and (self.peek().text in self.enums
@@ -1615,12 +2076,22 @@ class Parser:
                          or (self.peek(1).kind == 'LBRACK'
                              and self._looks_like_type_bracket())))):
             t = self.parse_type()
-            name = self.eat('ID').text
-            init = None
-            if self.accept('ASSIGN'):
-                init = self.parse_expr()
-            return Stmt(kind='decl', decl_type=t, decl_name=name,
-                        decl_init=init)
+            # One declaration statement may name several variables of that
+            # type -- `int b = a + 1, limit = a + 15;` -- the same shape
+            # parse_decl accepts for the program's own leading decls.
+            group: List[Stmt] = []
+            while True:
+                name = self.eat('ID').text
+                init = None
+                if self.accept('ASSIGN'):
+                    init = self.parse_expr()
+                group.append(Stmt(kind='decl', decl_type=t, decl_name=name,
+                                  decl_init=init))
+                if not self.accept('COMMA'):
+                    break
+            if len(group) > 1:
+                group[0].decl_siblings = group[1:]
+            return group[0]
         # swap(lhs1, lhs2) as a statement
         if (self.peek().kind == 'ID' and self.peek().text == 'swap'
                 and self.peek(1).kind == 'LPAREN'):
@@ -1663,6 +2134,15 @@ class Parser:
         idx_extra: List[Expr] = []
         if self.accept('LBRACK'):
             idx = self.parse_expr()
+            # `D[lo..hi] = ...` is a slice ASSIGNMENT: copy a run of elements
+            # into D starting at lo. The `..` is what tells it apart from the
+            # ordinary `D[i] = ...` element store.
+            if self.accept('DOTDOT'):
+                hi = self.parse_expr()
+                self.eat('RBRACK')
+                self.eat('ASSIGN')
+                return Stmt(kind='slice_assign', lhs_name=name,
+                            slice_lo=idx, slice_hi=hi, rhs=self.parse_expr())
             self.eat('RBRACK')
             if self.accept('LBRACK'):
                 idx2 = self.parse_expr()
@@ -1830,6 +2310,19 @@ class Parser:
                         f'record `{rname}` has {want} field(s) but '
                         f'{len(args)} were given')
                 return Expr(kind='new_record', name=rname, args=args)
+            # `new heap<int>()` -- the only constructor form for the heap
+            # builtin; codegen ignores this node's shape entirely and
+            # always emits a fixed PriorityQueue<int[]> constructor (see
+            # gen_expr's 'new_heap' case), so nothing here needs capturing.
+            if (self.peek().kind == 'ID' and self.peek().text == 'heap'
+                    and self.peek(1).kind == 'LT'):
+                self.eat('ID')
+                self.eat('LT')
+                self.eat('KW_INT')
+                self.eat('GT')
+                self.eat('LPAREN')
+                self.eat('RPAREN')
+                return Expr(kind='new_heap')
             base_tok = self.eat('KW_INT', 'KW_DOUBLE', 'KW_BOOLEAN')
             self.eat('LBRACK')
             size = self.parse_expr()
@@ -1874,8 +2367,11 @@ class Parser:
         # reserved.  For `map`, the body is a value expression (one per index
         # of the range); for `filter` it is a boolean predicate (the indices
         # satisfying it form the result).
+        # `argmin`/`argmax` take the same shape but return the INDEX that
+        # minimises/maximises the body rather than the body's value, with
+        # ties going to the lowest index and -1 when nothing is selected.
         QUANT_NAMES = {'min', 'max', 'sum', 'count', 'exists', 'forall',
-                       'map', 'filter'}
+                       'map', 'filter', 'argmin', 'argmax'}
         if t.text in QUANT_NAMES and t.kind in ('ID', 'KW_EXISTS', 'KW_FORALL'):
             save = self.pos
             self.eat(t.kind)
@@ -1883,6 +2379,12 @@ class Parser:
                 var = self.eat('ID').text
                 self.eat('KW_IN')
                 lo, hi, setexpr = self.parse_range_or_set()
+                # Optional `where PRED` clause -- restricts the range. `where`
+                # is a contextual identifier, not a reserved word.
+                where = None
+                if (self.peek().kind == 'ID' and self.peek().text == 'where'):
+                    self.eat('ID')
+                    where = self.parse_expr()
                 # Optional `pick ID` clause -- witness capture for exists.
                 pick_var = None
                 if self.accept('KW_PICK'):
@@ -1892,7 +2394,7 @@ class Parser:
                 qname = t.text
                 return Expr(kind='quant', quant=qname, q_var=var,
                             q_lo=lo, q_hi=hi, q_set=setexpr, q_body=body,
-                            pick_var=pick_var)
+                            q_where=where, pick_var=pick_var)
             # otherwise it's a function call: rewind and parse as ID
             self.pos = save
             name = self.eat(t.kind).text
@@ -1913,6 +2415,13 @@ class Parser:
             e: Expr = Expr(kind='call', name=name, args=args)
         elif self.accept('LBRACK'):
             i = self.parse_expr()
+            # `a[lo..hi]` is a SLICE, not an index: the inclusive sub-range
+            # copied out as a fresh array. Distinguished from `a[i]` purely
+            # by the `..` that follows the first expression.
+            if self.accept('DOTDOT'):
+                hi = self.parse_expr()
+                self.eat('RBRACK')
+                return Expr(kind='slice', name=name, slice_lo=i, slice_hi=hi)
             self.eat('RBRACK')
             e = Expr(kind='index', name=name, idx=i)
             # Optional second index for 2D arrays: A[i][j]
@@ -1975,7 +2484,29 @@ _VEC_SLOT = '\x00vec-helpers\x00'
 _BOXED = {'int': 'Integer', 'double': 'Double', 'boolean': 'Boolean'}
 
 
+# The one constructor form for the `heap<int>` builtin.  Ordered
+# lexicographically (key, then value): a 1-arg push(value) always has
+# key==value so the tie-break is a no-op there; for a 2-arg push(key, value)
+# with equal keys (e.g. Dijkstra's equal-cost vertices) the tie-break only
+# changes extraction order among ties, not the computed result -- but it DOES
+# matter for LLP-IntervalPartition's push(finish, room), which relies on the
+# room-number tie-break to reuse the lowest-numbered free room among rooms
+# that fall free at the same instant.
+#
+# Used from three places, which between them cover both lifetimes a heap can
+# have: gen_stmt's 'decl' case (a mid-body local, consumed within one method)
+# and _init_body_lines / _emit_ctors (a program FIELD declared at the top of a
+# guard-bearing body, which persists across advance calls -- what an O(n log n)
+# LLP program needs, since rebuilding the heap per advance is what makes the
+# naive formulation quadratic or worse).
+_HEAP_CTOR = ('new java.util.PriorityQueue<int[]>('
+              '(a, b) -> a[0] != b[0] ? Integer.compare(a[0], b[0]) '
+              ': Integer.compare(a[1], b[1]))')
+
+
 def java_base_type(t: Type) -> str:
+    if t.is_heap:
+        return 'java.util.PriorityQueue<int[]>'
     if t.is_list:
         elem = 'LinkedList<' + _BOXED.get(t.base, t.base) + '>'
         if t.is_2d:
@@ -2028,9 +2559,21 @@ def _is_wholesale_init(init) -> bool:
     declared is itself array-typed, a well-typed source program can only
     have gotten here if the indexed expression *also* evaluates to an
     array -- a source program where it evaluated to a scalar would already
-    be a type error unrelated to this decision."""
+    be a type error unrelated to this decision.
+
+    `map`/`filter` quantifiers likewise produce a whole `int[]` (see the
+    `map i in [a..b] : E` note in syntax.md); without them here an
+    `int[] xs = filter i in ... : P;` fell through to the scalar-broadcast
+    branch and emitted a fill loop assigning an int[] into each int slot,
+    which does not compile. Same gap, same shape, as the 'call' case
+    above."""
+    if init is not None and init.kind == 'quant' and init.quant in ('map', 'filter'):
+        return True
+    # A slice is a whole array value too (`int[] head = a[0..2];`); without
+    # it here the same scalar-broadcast branch fired, emitting a fill loop
+    # that assigns an int[] into each int slot.
     return init is not None and init.kind in ('method_call', 'call', 'new_array',
-                                               'index', 'index2')
+                                               'index', 'index2', 'slice')
 
 
 def java_zero(t: Type) -> str:
@@ -2123,10 +2666,21 @@ class CodeGen:
         # Stack of variable names currently in scope for quantifier helpers.
         # Always starts with the rule's forbidden-index (filled in at emit()).
         self._q_scope: List[str] = []
+        # Name -> Type for the enclosing method's params and local decls that
+        # are NOT class fields; emit_quant_helper captures from here.
+        self._local_types: dict = {}
         # Java type of a name in `_q_scope`, when it is not the usual int --
         # a receive binder is an array or an enum array, and a lifted
         # quantifier helper has to declare it correctly.
         self._scope_types: dict = {}
+        # Names, within the method currently being emitted, declared
+        # `heap<int>` -- _expr_type can't see an inline mid-body local's
+        # type (only program-level fields/params, see its 'id' case), so
+        # gen_expr's 'method_call' case consults this set directly instead.
+        # Reset per-method (see _emit_aux_method/_emit_method): a heap var
+        # is always method-local, never a field or param (unsupported --
+        # see the is_heap assertions in java_zero/_emit_local_decl).
+        self._heap_vars: set = set()
         # Current target type for `infinity` emission (flipped by _with_type).
         self._infty: str = 'Integer.MAX_VALUE'
         # `--noclass` mode: emit methods as `public static` so they can be
@@ -2137,6 +2691,16 @@ class CodeGen:
         # True while emitting a method declared void, where `return X` has
         # to come out as a bare `return;`.
         self._in_void_method: bool = False
+        # The current method's `ensures` clauses, with every `old(expr)`
+        # already rewritten to the snapshot local that holds expr's
+        # entry-time value (see _emit_contract_preamble). Empty outside a
+        # method that declares `ensures`. gen_stmt's 'return' case reads
+        # this to insert the checks before every exit.
+        self._current_ensures: List['Expr'] = []
+        # True while emitting a guard's advance body, so an assignment
+        # that lowers a priority key can push the index back onto the
+        # container (see _priority_array).
+        self._in_advance: bool = False
         # Witness variables captured by a `pick` outside a guard.
         self._picks_used: set = set()
         self._vec_helpers: set = set()
@@ -2210,6 +2774,20 @@ class CodeGen:
                     return Type(base=base.base, is_array=True)
                 return Type(base=base.base, is_array=True, is_2d=True, dims=remaining)
             return None
+        if k == 'slice':
+            base = self._expr_type(Expr(kind='id', name=e.name))
+            if base is None: return None
+            return Type(base=base.base, is_array=True, is_list=base.is_list)
+        if k == 'call':
+            # A call to one of this program's own aux methods is typed by that
+            # method's declared return type, so `minCrossCut(j) < infinity`
+            # knows `infinity` means Double.POSITIVE_INFINITY when
+            # minCrossCut returns double.  Without this the comparison fell
+            # back to the emitter's int default, Integer.MAX_VALUE.
+            for m in self.p.aux_methods:
+                if m.name == e.name:
+                    return m.return_type
+            return None
         if k == 'field_access':
             owner = self._expr_type(
                 Expr(kind='id', name=e.lhs.name)
@@ -2258,6 +2836,50 @@ class CodeGen:
             a, b = b, a
         call = f'{name}({a}, {b})'
         return f'(!{call})' if e.op == '!=' else call
+
+    def _num_base(self, e: 'Expr') -> str:
+        """'double' if the expression is real-valued, else 'int'.  Deliberately
+        conservative: any shape whose type cannot be read off is reported as
+        'int', which is what the numeric aggregates (min/max/sum) assumed
+        unconditionally before this existed."""
+        if e is None:
+            return 'int'
+        k = e.kind
+        if k == 'real':
+            return 'double'
+        if k == 'id':
+            # A quantifier variable bound over a list of reals is in scope
+            # only as a (boxed) Java type, not as a declaration.
+            st = self._scope_types.get(e.name)
+            if st in ('double', 'Double'):
+                return 'double'
+        if k in ('id', 'index', 'index2', 'field_access'):
+            t = self._expr_type(e)
+            return 'double' if (t is not None and t.base == 'double') else 'int'
+        if k == 'bin':
+            if e.op in ('+', '-', '*', '/', '%'):
+                if 'double' in (self._num_base(e.lhs), self._num_base(e.rhs)):
+                    return 'double'
+            return 'int'
+        if k == 'un':
+            return self._num_base(e.lhs)
+        if k == 'quant':
+            if e.quant in ('min', 'max', 'sum'):
+                return self._num_base(e.q_body)
+            return 'int'
+        if k == 'call':
+            # `min(a, b)` / `max(a, b)` / `abs(a)` widen like the arithmetic
+            # operators; a call of an aux method is typed by its declaration.
+            if e.name in ('min', 'max', 'abs'):
+                if any(self._num_base(a) == 'double' for a in e.args):
+                    return 'double'
+                return 'int'
+            for m in self.p.aux_methods:
+                if m.name == e.name:
+                    rt = m.return_type
+                    return 'double' if (rt is not None
+                                        and rt.base == 'double') else 'int'
+        return 'int'
 
     def _elem_java_type(self, set_expr) -> str:
         """Java type of an element of a set- or list-valued expression."""
@@ -2357,6 +2979,41 @@ class CodeGen:
                 lines.append('  }')
         lines.append('')
 
+    @property
+    def _container_field(self) -> bool:
+        """True when the lazy-deletion priority queue is the lowering in use:
+        a single-index guard whose priority is a plain `A[j]`.  Multi-index
+        guards keep the rescan lowering."""
+        return (self.p.mode == 'heap' and len(self._heap_mode_indices()) == 1
+                and self._priority_array() is not None)
+
+    @property
+    def _static_priority(self) -> bool:
+        """True when the setPriority expression reads nothing but the guard's
+        own index variables -- `j`, or `j - i`.  Such a key cannot change as
+        the program runs, so the order of the indices is fixed before the
+        loop starts and can be computed once instead of re-derived on every
+        advance.  A key that reads program state (LLP-Layering's
+        `max i in pre[j] : G[i] + 1`) is not static and keeps the rescan."""
+        if self.p.mode != 'priority' or self.p.priority_expr is None:
+            return False
+        return not (self._free_names(self.p.priority_expr)
+                    - set(self._heap_mode_indices()))
+
+    def _priority_array(self) -> Optional[str]:
+        """The array the setPriority expression indexes, when it is a simple
+        `A[j]` on the guard's index -- the only shape for which lowering an
+        element is known to change exactly that index's key.  Returns None
+        for anything else, in which case no re-push is emitted and the
+        program keeps whatever ordering its initial keys gave."""
+        e = self.p.priority_expr
+        idx = self._heap_mode_indices()
+        if (e is not None and e.kind == 'index' and len(idx) == 1
+                and e.idx is not None and e.idx.kind == 'id'
+                and e.idx.name == idx[0]):
+            return e.name
+        return None
+
     def _with_type(self, t: Type, f):
         """Run `f` with self._infty temporarily set to match the target type."""
         prev = self._infty
@@ -2389,6 +3046,15 @@ class CodeGen:
             return e.name
         if k == 'index':
             return f'{e.name}[{self.gen_expr(e.idx)}]'
+        if k == 'slice':
+            # a[lo..hi] is INCLUSIVE of hi, Arrays.copyOfRange's `to` is not,
+            # hence hi+1. Math.max keeps an empty slice (hi < lo) empty
+            # instead of throwing, matching the empty-range convention the
+            # quantifiers already use.
+            lo = self.gen_expr(e.slice_lo)
+            hi = self.gen_expr(e.slice_hi)
+            return (f'java.util.Arrays.copyOfRange({e.name}, {lo}, '
+                    f'Math.max({lo}, ({hi}) + 1))')
         if k == 'index2':
             dims = ''.join(f'[{self.gen_expr(x)}]'
                            for x in [e.idx, e.rhs, *e.idx_extra])
@@ -2492,6 +3158,53 @@ class CodeGen:
         if k == 'method_call':
             obj  = self.gen_expr(e.lhs)
             args = ', '.join(self.gen_expr(a) for a in e.args)
+            # heap<int> builtin methods -- checked via _heap_vars rather
+            # than _expr_type(e.lhs), since _expr_type only resolves
+            # program-level fields/params, not an inline mid-body local
+            # (which is what a heap var always is; see CodeGen._heap_vars).
+            if e.lhs.kind == 'id' and e.lhs.name in self._heap_vars:
+                if e.name == 'push' and len(e.args) == 1:
+                    v = self.gen_expr(e.args[0])
+                    return f'{obj}.add(new int[]{{{v}, {v}}})'
+                if e.name == 'push' and len(e.args) == 2:
+                    kk, vv = (self.gen_expr(e.args[0]), self.gen_expr(e.args[1]))
+                    return f'{obj}.add(new int[]{{{kk}, {vv}}})'
+                if e.name == 'peekKey' and not e.args:
+                    return f'{obj}.peek()[0]'
+                if e.name == 'peekValue' and not e.args:
+                    return f'{obj}.peek()[1]'
+                if e.name == 'removeMin' and not e.args:
+                    return f'{obj}.poll()'
+                if e.name == 'isEmpty' and not e.args:
+                    return f'{obj}.isEmpty()'
+                if e.name == 'size' and not e.args:
+                    return f'{obj}.size()'
+                raise NotImplementedError(
+                    f'unsupported heap<int> method call: {e.name}'
+                    f'({args}) -- supported: push(value), push(key, value), '
+                    'peekKey(), peekValue(), removeMin(), isEmpty(), size()')
+            # Cross-class call to a SPECIFIC named method of another program
+            # (e.g. `UnionFind.union(parent, rank, u, v)` -> `new
+            # UnionFind().union(parent, rank, u, v)`), as distinct from the
+            # existing `Other(args)` bare-call convention (~line 2511 above)
+            # which always invokes the callee's single designated entry
+            # method. Needed when the callee has more than one method a
+            # caller legitimately wants to reach (UnionFind exposes both
+            # `find` and `union`; Kruskal.llp only ever needs `union`, but
+            # the mechanism doesn't assume that). Recognised only when the
+            # lhs is a bare id matching a known sibling program -- distinct
+            # from an ordinary instance/field method call, which falls
+            # through to the `_expr_type` path below unchanged.
+            if (e.lhs.kind == 'id' and self.signatures
+                    and e.lhs.name in self.signatures
+                    and e.lhs.name != self.p.name):
+                callee = self.signatures[e.lhs.name]
+                valid_methods = {callee.entry_name} | {m.name for m in callee.aux_methods}
+                if e.name not in valid_methods:
+                    raise SyntaxError(
+                        f"'{e.lhs.name}.{e.name}(...)': no such method on "
+                        f"'{e.lhs.name}' -- it has {sorted(valid_methods)}")
+                return f'new {e.lhs.name}().{e.name}({args})'
             t = self._expr_type(e.lhs)
             if (e.name == 'insert' and len(e.args) == 1
                     and t is not None and t.is_list):
@@ -2525,10 +3238,10 @@ class CodeGen:
         accumulator pattern and return the lines.  Otherwise return None
         so the caller falls through to the lift-to-temp path.
 
-            int m = <scalar-or-sentinel>;
+            int t1 = <scalar-or-sentinel>;     // fresh name, see below
             for (var : set)
-                m = Math.max(m, body);
-            lhs = m;
+                t1 = Math.max(t1, body);
+            lhs = t1;
         """
         rhs = s.rhs
         quant = None
@@ -2564,13 +3277,30 @@ class CodeGen:
             return None
 
         out: List[str] = []
+        # Fresh accumulator name, from the same counter the lift-to-temp path
+        # uses.  This used to be a hardcoded `m`, which collided two ways: a
+        # second min/max reduction in the same method re-declared it, and any
+        # program with its own `m` (e.g. `int m = v.length;`) was shadowed --
+        # both produce Java that does not compile.
+        self._fresh += 1
+        acc = f't{self._fresh}'
+        # Accumulator type follows the operands, not the ambient default:
+        # a `min` over a double-valued body needs `double m` seeded with
+        # Double.POSITIVE_INFINITY, or the emitted Math.min() is a lossy
+        # conversion and javac rejects it.
+        acct = self._num_base(quant.q_body)
+        if init_expr is not None and self._num_base(init_expr) == 'double':
+            acct = 'double'
         # Initialiser.
         if init_expr is not None:
             init_str = self.gen_expr(init_expr)
+        elif acct == 'double':
+            init_str = ('Double.POSITIVE_INFINITY' if op == 'min'
+                        else 'Double.NEGATIVE_INFINITY')
         else:
             init_str = ('Integer.MAX_VALUE' if op == 'min'
                         else 'Integer.MIN_VALUE')
-        out.append(f'{indent}int m = {init_str};')
+        out.append(f'{indent}{acct} {acc} = {init_str};')
         # Loop header.
         if quant.q_set is not None:
             setexpr = self.gen_expr(quant.q_set)
@@ -2584,9 +3314,17 @@ class CodeGen:
         self._q_scope.append(quant.q_var)
         try:
             body_expr = self.gen_expr(quant.q_body)
+            # `where PRED` is generated with the quantifier variable in scope,
+            # exactly like the body.
+            where_expr = (self.gen_expr(quant.q_where)
+                          if quant.q_where is not None else None)
         finally:
             self._q_scope.pop()
-        out.append(f'{loop_hdr} m = Math.{op}(m, {body_expr});')
+        if where_expr is None:
+            out.append(f'{loop_hdr} {acc} = Math.{op}({acc}, {body_expr});')
+        else:
+            out.append(f'{loop_hdr} {{ if (!({where_expr})) continue; '
+                       f'{acc} = Math.{op}({acc}, {body_expr}); }}')
         # Final assignment to the original LHS.
         lhs = s.lhs_name
         if s.lhs_index is not None:
@@ -2595,7 +3333,7 @@ class CodeGen:
                 lhs = f'{lhs}[{self.gen_expr(s.lhs_index2)}]'
                 for extra in s.lhs_index_extra:
                     lhs = f'{lhs}[{self.gen_expr(extra)}]'
-        out.append(f'{indent}{lhs} = m;')
+        out.append(f'{indent}{lhs} = {acc};')
         return out
 
     def _emit_pred_procedural(self, expr: 'Expr', lines: List[str],
@@ -2664,13 +3402,80 @@ class CodeGen:
             return False
         if e.kind == 'quant':
             return True
-        for attr in ('lhs', 'rhs', 'idx'):
+        for attr in ('lhs', 'rhs', 'idx', 'slice_lo', 'slice_hi'):
             if self._contains_quant(getattr(e, attr, None)):
                 return True
         for a in (getattr(e, 'args', None) or []):
             if self._contains_quant(a):
                 return True
         return False
+
+    def _field_name_set(self) -> set:
+        """Names the class emits as fields, which a quantifier helper can read
+        without being handed them.  Only a guard-bearing or stateful program
+        has fields at all; a pure-method program keeps everything in locals,
+        so for one of those this is empty and every referenced local has to be
+        captured instead (see emit_quant_helper)."""
+        if not (self._has_guards or self.p.stateful):
+            return set()
+        names = {p.name for p in self.p.params} | {d.name for d in self.p.decls}
+        names.add('n')
+        return names
+
+    def _free_names(self, e: Optional['Expr'], out: Optional[set] = None) -> set:
+        """Every identifier the expression reads: bare `id`s and the base name
+        of any index/index2.  Used to work out what a lifted quantifier helper
+        has to be passed."""
+        if out is None:
+            out = set()
+        if e is None or not isinstance(e, Expr):
+            return out
+        if e.kind in ('id', 'index', 'index2', 'method_call', 'slice') and e.name:
+            out.add(e.name)
+        for attr in ('lhs', 'rhs', 'idx', 'idx2', 'q_lo', 'q_hi', 'q_set', 'q_body', 'q_where',
+                     'slice_lo', 'slice_hi'):
+            self._free_names(getattr(e, attr, None), out)
+        for a in (getattr(e, 'args', None) or []):
+            self._free_names(a, out)
+        for a in (getattr(e, 'idx_extra', None) or []):
+            self._free_names(a, out)
+        return out
+
+    def _conjuncts(self, e: Optional['Expr']) -> List['Expr']:
+        """Flatten a top-level `a && b && c` into [a, b, c]."""
+        if e is not None and e.kind == 'bin' and e.op in ('&&', 'and'):
+            return self._conjuncts(e.lhs) + self._conjuncts(e.rhs)
+        return [e] if e is not None else []
+
+    def _emit_conjunctive_guard(self, pred: Optional['Expr'],
+                                indent: str) -> List[str]:
+        """Emit a guard as a sequence of short-circuiting tests.
+
+        Hoisting a quantifier into a statement before the `return` loses
+        the short-circuit that `&&` promises, and that is not merely
+        slower -- LLP-Antichain's guard is
+
+            G[j] < len[j] && (exists k : ... chains[j][G[j]] ...)
+
+        where the quantifier reads chains[j][G[j]], in range only while
+        the left conjunct holds. Evaluating it first threw
+        ArrayIndexOutOfBounds the moment a chain was exhausted.
+
+        Emitting one conjunct at a time, each after the previous has
+        passed, restores Java's own `&&` semantics: a quantifier runs
+        only if everything to its left was true.
+        """
+        out: List[str] = []
+        parts = self._conjuncts(pred)
+        if not parts:
+            return [f'{indent}return true;']
+        for c in parts:
+            pre: List[str] = []
+            rewritten = self._inline_quant_in_expr(c, pre, indent)
+            out.extend(pre)
+            out.append(f'{indent}if (!({self.gen_expr(rewritten)})) return false;')
+        out.append(f'{indent}return true;')
+        return out
 
     def _inline_quant_in_expr(self, expr: 'Expr', pre_lines: List[str],
                                 indent: str) -> 'Expr':
@@ -2705,7 +3510,40 @@ class CodeGen:
                          for x in expr.idx_extra]
             return Expr(kind='index2', name=expr.name,
                         idx=new_idx, rhs=new_rhs, idx_extra=new_extra)
+        if k == 'slice':
+            return Expr(kind='slice', name=expr.name,
+                        slice_lo=self._inline_quant_in_expr(expr.slice_lo, pre_lines, indent),
+                        slice_hi=self._inline_quant_in_expr(expr.slice_hi, pre_lines, indent))
         return expr
+
+    def _rename_free(self, e: Optional['Expr'], old: str, new: str) -> Optional['Expr']:
+        """A copy of e with every FREE occurrence of the plain identifier
+        `old` renamed to `new`. A nested quantifier that rebinds `old` as
+        its own q_var shadows it: `old` inside that quantifier's body/where
+        refers to the INNER binding, so only its range bounds (q_lo, q_hi,
+        q_set -- evaluated in the outer scope) are renamed, not q_body/
+        q_where. Used to avoid a Java variable-redeclaration error when a
+        quantifier's bound variable collides with an already-in-scope name
+        (see _lift_quant / emit_quant_helper)."""
+        if e is None or not hasattr(e, 'kind'):
+            return e
+        if e.kind == 'id' and e.name == old:
+            return Expr(kind='id', name=new)
+        if e.kind == 'quant' and e.q_var == old:
+            new_e = dataclasses.replace(e)
+            new_e.q_lo = self._rename_free(e.q_lo, old, new)
+            new_e.q_hi = self._rename_free(e.q_hi, old, new)
+            new_e.q_set = self._rename_free(e.q_set, old, new)
+            return new_e
+        new_e = dataclasses.replace(e)
+        for fl in dataclasses.fields(e):
+            v = getattr(e, fl.name, None)
+            if isinstance(v, Expr):
+                setattr(new_e, fl.name, self._rename_free(v, old, new))
+            elif isinstance(v, list) and v and isinstance(v[0], Expr):
+                setattr(new_e, fl.name,
+                       [self._rename_free(x, old, new) for x in v])
+        return new_e
 
     def _lift_quant(self, e: 'Expr', pre_lines: List[str], indent: str) -> 'Expr':
         """Emit Java that runs the quantifier `e`'s loop into `pre_lines`,
@@ -2714,6 +3552,18 @@ class CodeGen:
         nested inside the body are recursively inlined too (their lifted
         statements are placed inside the outer loop), so the result is
         a flat tree of for-loops with no helper methods."""
+        if e.q_var in self._q_scope:
+            # The bound variable collides with a parameter or a local
+            # already in scope here -- Java forbids a for-loop variable
+            # from redeclaring either. `$` can never appear in an LL
+            # identifier (see TOKEN_SPEC's ID pattern), so suffixing with
+            # it is a permanently collision-free rename.
+            self._fresh += 1
+            fresh_var = f'{e.q_var}${self._fresh}'
+            e = dataclasses.replace(
+                e, q_var=fresh_var,
+                q_body=self._rename_free(e.q_body, e.q_var, fresh_var),
+                q_where=self._rename_free(e.q_where, e.q_var, fresh_var))
         self._fresh += 1
         tmp = f't{self._fresh}'
         inner = indent + '  '
@@ -2734,39 +3584,80 @@ class CodeGen:
             body_pre: List[str] = []
             body_inlined = self._inline_quant_in_expr(e.q_body, body_pre, inner)
             body_expr = self.gen_expr(body_inlined)
+            # Accumulator type follows the body's, so min/max/sum work over
+            # reals (read off while the quantifier variable is in scope).
+            acct = self._num_base(e.q_body)
+            where_expr = (self.gen_expr(e.q_where)
+                          if e.q_where is not None else None)
         finally:
             self._q_scope.pop()
+        # See emit_quant_helper: the guard goes first in the loop body, before
+        # any nested-quantifier lifting, so a rejected index does no work.
+        guard = ([] if where_expr is None
+                 else [f'{inner}if (!({where_expr})) continue;'])
         if e.quant in ('min', 'max'):
-            init = ('Integer.MAX_VALUE' if e.quant == 'min'
-                    else 'Integer.MIN_VALUE')
+            if acct == 'double':
+                init = ('Double.POSITIVE_INFINITY' if e.quant == 'min'
+                        else 'Double.NEGATIVE_INFINITY')
+            else:
+                init = ('Integer.MAX_VALUE' if e.quant == 'min'
+                        else 'Integer.MIN_VALUE')
             cmp = '<' if e.quant == 'min' else '>'
-            pre_lines.append(f'{indent}int {tmp} = {init};')
+            pre_lines.append(f'{indent}{acct} {tmp} = {init};')
             pre_lines.append(loop_hdr)
+            pre_lines.extend(guard)
             pre_lines.extend(body_pre)
-            pre_lines.append(f'{inner}int v = {body_expr};')
-            pre_lines.append(f'{inner}if (v {cmp} {tmp}) {tmp} = v;')
+            # `_v`, not `v`: this loop is spliced into the enclosing method,
+            # so a plain `v` collides with any program variable of that name
+            # (e.g. FPTASKnapsack's `int[] v` value array). The `_`-prefix
+            # is the same convention the map/filter branches already use.
+            pre_lines.append(f'{inner}{acct} _v = {body_expr};')
+            pre_lines.append(f'{inner}if (_v {cmp} {tmp}) {tmp} = _v;')
+            pre_lines.append(f'{indent}}}')
+        elif e.quant in ('argmin', 'argmax'):
+            # Same scan, but `tmp` holds the best INDEX; the running best
+            # value lives in a companion local.  -1 when nothing is selected.
+            if acct == 'double':
+                init = ('Double.POSITIVE_INFINITY' if e.quant == 'argmin'
+                        else 'Double.NEGATIVE_INFINITY')
+            else:
+                init = ('Integer.MAX_VALUE' if e.quant == 'argmin'
+                        else 'Integer.MIN_VALUE')
+            cmp = '<' if e.quant == 'argmin' else '>'
+            best = f'{tmp}_best'
+            pre_lines.append(f'{indent}{acct} {best} = {init};')
+            pre_lines.append(f'{indent}int {tmp} = -1;')
+            pre_lines.append(loop_hdr)
+            pre_lines.extend(guard)
+            pre_lines.extend(body_pre)
+            pre_lines.append(f'{inner}{acct} _v = {body_expr};')
+            pre_lines.append(f'{inner}if (_v {cmp} {best}) {{ {best} = _v; {tmp} = {e.q_var}; }}')
             pre_lines.append(f'{indent}}}')
         elif e.quant == 'sum':
-            pre_lines.append(f'{indent}int {tmp} = 0;')
+            pre_lines.append(f'{indent}{acct} {tmp} = 0;')
             pre_lines.append(loop_hdr)
+            pre_lines.extend(guard)
             pre_lines.extend(body_pre)
             pre_lines.append(f'{inner}{tmp} += {body_expr};')
             pre_lines.append(f'{indent}}}')
         elif e.quant == 'count':
             pre_lines.append(f'{indent}int {tmp} = 0;')
             pre_lines.append(loop_hdr)
+            pre_lines.extend(guard)
             pre_lines.extend(body_pre)
             pre_lines.append(f'{inner}if ({body_expr}) {tmp}++;')
             pre_lines.append(f'{indent}}}')
         elif e.quant == 'forall':
             pre_lines.append(f'{indent}boolean {tmp} = true;')
             pre_lines.append(loop_hdr)
+            pre_lines.extend(guard)
             pre_lines.extend(body_pre)
             pre_lines.append(f'{inner}if (!({body_expr})) {{ {tmp} = false; break; }}')
             pre_lines.append(f'{indent}}}')
         elif e.quant == 'exists':
             pre_lines.append(f'{indent}boolean {tmp} = false;')
             pre_lines.append(loop_hdr)
+            pre_lines.extend(guard)
             pre_lines.extend(body_pre)
             pre_lines.append(f'{inner}if ({body_expr}) {{ {tmp} = true; break; }}')
             pre_lines.append(f'{indent}}}')
@@ -2774,6 +3665,7 @@ class CodeGen:
             acc = f'{tmp}_acc'
             pre_lines.append(f'{indent}java.util.ArrayList<Integer> {acc} = new java.util.ArrayList<>();')
             pre_lines.append(loop_hdr)
+            pre_lines.extend(guard)
             pre_lines.append(f'{indent}  {acc}.add({body_expr});')
             pre_lines.append(f'{indent}}}')
             pre_lines.append(f'{indent}int[] {tmp} = new int[{acc}.size()];')
@@ -2782,12 +3674,16 @@ class CodeGen:
             acc = f'{tmp}_acc'
             pre_lines.append(f'{indent}java.util.ArrayList<Integer> {acc} = new java.util.ArrayList<>();')
             pre_lines.append(loop_hdr)
+            pre_lines.extend(guard)
             pre_lines.append(f'{indent}  if ({body_expr}) {acc}.add({e.q_var});')
             pre_lines.append(f'{indent}}}')
             pre_lines.append(f'{indent}int[] {tmp} = new int[{acc}.size()];')
             pre_lines.append(f'{indent}for (int _i = 0; _i < {tmp}.length; _i++) {tmp}[_i] = {acc}.get(_i);')
         else:
             raise NotImplementedError(f'inline {e.quant!r}')
+        if e.quant in ('min', 'max', 'sum') and acct == 'double':
+            # So an enclosing aggregate reading this temp widens too.
+            self._scope_types[tmp] = acct
         return Expr(kind='id', name=tmp)
 
     def _for_loop_test(self, var: str, hi_expr: 'Expr') -> str:
@@ -2810,9 +3706,40 @@ class CodeGen:
         # Every enclosing quantifier variable and the rule's forbidden-index
         # is passed in as a parameter so the helper can see them.
         mname = self.fresh('q')
-        params_sig = ', '.join(
-            f'{self._scope_types.get(v, "int")} {v}' for v in self._q_scope)
-        call_args = ', '.join(self._q_scope)
+        captured = list(self._q_scope)
+        sig_parts = [f'{self._scope_types.get(v, "int")} {v}'
+                     for v in self._q_scope]
+        # `_q_scope` carries only scalars, because an array the body reads is
+        # normally a FIELD and so already visible inside the helper. In a
+        # pure-method program there are no fields -- params and decls are
+        # locals of the entry method -- so any array/set the quantifier touches
+        # has to be captured explicitly, or the helper references a name that
+        # does not exist there (javac: "cannot find symbol").
+        fields = self._field_name_set()
+        refs = self._free_names(e.q_body)
+        for sub in (e.q_lo, e.q_hi, e.q_set):
+            self._free_names(sub, refs)
+        for nm in sorted(refs):
+            if nm in captured or nm in fields:
+                continue
+            lt = self._local_types.get(nm)
+            if lt is None:
+                continue
+            captured.append(nm)
+            sig_parts.append(f'{java_base_type(lt)} {nm}')
+        if e.q_var in captured:
+            # The bound variable collides with one of the helper's own
+            # captured parameters -- Java forbids a local (the for-loop
+            # variable) from redeclaring a parameter. Same collision-free
+            # rename as _lift_quant; see its comment for why `$` is safe.
+            self._fresh += 1
+            fresh_var = f'{e.q_var}${self._fresh}'
+            e = dataclasses.replace(
+                e, q_var=fresh_var,
+                q_body=self._rename_free(e.q_body, e.q_var, fresh_var),
+                q_where=self._rename_free(e.q_where, e.q_var, fresh_var))
+        params_sig = ', '.join(sig_parts)
+        call_args = ', '.join(captured)
         # lo / hi / set are in the outer scope -- evaluate them first.
         if e.q_set is not None:
             setexpr = self.gen_expr(e.q_set)
@@ -2832,42 +3759,84 @@ class CodeGen:
         self._q_scope.append(e.q_var)
         try:
             body = self.gen_expr(e.q_body)
+            # The accumulator's type follows the body's, so min/max/sum work
+            # over reals as well as integers.  Read off here, while the
+            # quantifier variable is still in scope.
+            acct = self._num_base(e.q_body)
+            where_expr = (self.gen_expr(e.q_where)
+                          if e.q_where is not None else None)
         finally:
             self._q_scope.pop()
             if qt != 'int':
                 self._scope_types.pop(e.q_var, None)
+        # `where PRED` restricts the range: skip the indices it rejects, so an
+        # empty selection falls through to the identity already seeded above.
+        guard = ([] if where_expr is None
+                 else [f'    if (!({where_expr})) continue;'])
         code = []
         if e.quant in ('min', 'max'):
-            init = ('Integer.MAX_VALUE' if e.quant == 'min'
-                    else 'Integer.MIN_VALUE')
+            if acct == 'double':
+                init = ('Double.POSITIVE_INFINITY' if e.quant == 'min'
+                        else 'Double.NEGATIVE_INFINITY')
+            else:
+                init = ('Integer.MAX_VALUE' if e.quant == 'min'
+                        else 'Integer.MIN_VALUE')
             cmp = '<' if e.quant == 'min' else '>'
-            code.append(f'private int {mname}({params_sig}) {{')
-            code.append(f'  int acc = {init};')
+            # `_acc` / `_v`, not `acc` / `v`: a free variable of the same
+            # name may be passed in as a parameter (see params_sig).
+            code.append(f'private {acct} {mname}({params_sig}) {{')
+            code.append(f'  {acct} _acc = {init};')
             code.append(loop_hdr)
-            code.append(f'    int v = {body};')
-            code.append(f'    if (v {cmp} acc) acc = v;')
+            code.extend(guard)
+            code.append(f'    {acct} _v = {body};')
+            code.append(f'    if (_v {cmp} _acc) _acc = _v;')
             code.append('  }')
-            code.append('  return acc;')
+            code.append('  return _acc;')
+            code.append('}')
+        elif e.quant in ('argmin', 'argmax'):
+            # Same scan as min/max, but the running best INDEX is what comes
+            # back.  Strict comparison, so the lowest index wins a tie; -1
+            # when the `where` clause (or an empty range) selects nothing,
+            # which is an index no range produces.
+            if acct == 'double':
+                init = ('Double.POSITIVE_INFINITY' if e.quant == 'argmin'
+                        else 'Double.NEGATIVE_INFINITY')
+            else:
+                init = ('Integer.MAX_VALUE' if e.quant == 'argmin'
+                        else 'Integer.MIN_VALUE')
+            cmp = '<' if e.quant == 'argmin' else '>'
+            code.append(f'private int {mname}({params_sig}) {{')
+            code.append(f'  {acct} _acc = {init};')
+            code.append('  int _arg = -1;')
+            code.append(loop_hdr)
+            code.extend(guard)
+            code.append(f'    {acct} _v = {body};')
+            code.append(f'    if (_v {cmp} _acc) {{ _acc = _v; _arg = {e.q_var}; }}')
+            code.append('  }')
+            code.append('  return _arg;')
             code.append('}')
         elif e.quant == 'sum':
-            code.append(f'private int {mname}({params_sig}) {{')
-            code.append('  int acc = 0;')
+            code.append(f'private {acct} {mname}({params_sig}) {{')
+            code.append(f'  {acct} _acc = 0;')
             code.append(loop_hdr)
-            code.append(f'    acc += {body};')
+            code.extend(guard)
+            code.append(f'    _acc += {body};')
             code.append('  }')
-            code.append('  return acc;')
+            code.append('  return _acc;')
             code.append('}')
         elif e.quant == 'count':
             code.append(f'private int {mname}({params_sig}) {{')
-            code.append('  int acc = 0;')
+            code.append('  int _acc = 0;')
             code.append(loop_hdr)
-            code.append(f'    if ({body}) acc++;')
+            code.extend(guard)
+            code.append(f'    if ({body}) _acc++;')
             code.append('  }')
-            code.append('  return acc;')
+            code.append('  return _acc;')
             code.append('}')
         elif e.quant == 'exists':
             code.append(f'private boolean {mname}({params_sig}) {{')
             code.append(loop_hdr)
+            code.extend(guard)
             if e.pick_var:
                 # Witness capture: stash the index that satisfied the body,
                 # exactly as a `pick` guard does, so the caller can bind it.
@@ -2882,6 +3851,7 @@ class CodeGen:
         elif e.quant == 'forall':
             code.append(f'private boolean {mname}({params_sig}) {{')
             code.append(loop_hdr)
+            code.extend(guard)
             code.append(f'    if (!({body})) return false;')
             code.append('  }')
             code.append('  return true;')
@@ -2892,6 +3862,7 @@ class CodeGen:
             code.append(f'private int[] {mname}({params_sig}) {{')
             code.append('  java.util.ArrayList<Integer> _acc = new java.util.ArrayList<>();')
             code.append(loop_hdr)
+            code.extend(guard)
             code.append(f'    _acc.add({body});')
             code.append('  }')
             code.append('  int[] arr = new int[_acc.size()];')
@@ -2904,6 +3875,7 @@ class CodeGen:
             code.append(f'private int[] {mname}({params_sig}) {{')
             code.append('  java.util.ArrayList<Integer> _acc = new java.util.ArrayList<>();')
             code.append(loop_hdr)
+            code.extend(guard)
             code.append(f'    if ({body}) _acc.add({e.q_var});')
             code.append('  }')
             code.append('  int[] arr = new int[_acc.size()];')
@@ -2918,21 +3890,34 @@ class CodeGen:
     def quant_return_type(self, e: Expr) -> str:
         if e.quant in ('exists', 'forall'):
             return 'boolean'
-        if e.quant == 'count':
+        if e.quant in ('count', 'argmin', 'argmax'):
+            # argmin/argmax return an index, whatever the body's own type.
             return 'int'
         if e.quant in ('map', 'filter'):
             return 'int[]'
-        return 'int'  # min, max, sum default; extend for real if needed
+        return self._num_base(e.q_body)  # min, max, sum: int or double
 
     # --- statements ---
-    def gen_stmts(self, stmts: List[Stmt], indent: str) -> List[str]:
+    def gen_stmts(self, stmts: List[Stmt], indent: str,
+                 pop_scope: bool = True) -> List[str]:
         out: List[str] = []
         saved = len(self._q_scope)
         for s in stmts:
             out.extend(self.gen_stmt(s, indent))
         # Restore scope: anything a local `decl` pushed goes out of scope
-        # at the end of its enclosing block.
-        del self._q_scope[saved:]
+        # at the end of its enclosing block. `pop_scope=False` is for the
+        # one case where `stmts` IS a method's own top-level body, not a
+        # nested block: _scan_result strips a simple trailing `return X;`
+        # before codegen ever sees it, and _emit_method/_emit_aux_method
+        # re-synthesize that return (plus any `ensures` check) themselves,
+        # AFTER this call -- at which point a top-level local is still
+        # genuinely in scope in the real generated Java, even though it
+        # was declared inside the statement list this call just finished.
+        # Popping it here made `ensures`'s quantifier-collision check
+        # (_lift_quant / emit_quant_helper) wrongly see an empty scope and
+        # skip renaming, letting a real collision through to javac.
+        if pop_scope:
+            del self._q_scope[saved:]
         return out
 
     def gen_stmt(self, s: Stmt, indent: str) -> List[str]:
@@ -2958,7 +3943,7 @@ class CodeGen:
         if s.kind == 'assign':
             # Fast path: detect `lhs = max(scalar, max-quant)` (or its
             # min/quant-only variants) and emit the textbook accumulator
-            # form `int m = init; for(...) m = Math.op(m, body); lhs = m;`.
+            # form `int tN = init; for(...) tN = Math.op(tN, body); lhs = tN;`.
             acc = self._try_emit_acc_assign(s, indent)
             if acc is not None:
                 return acc
@@ -2979,7 +3964,40 @@ class CodeGen:
                 lhs = f'{lhs}.{s.lhs_field}'
                 if s.lhs_field_index is not None:
                     lhs = f'{lhs}[{self.gen_expr(s.lhs_field_index)}]'
-            return pre + [f'{indent}{lhs} = {self.gen_expr(new_rhs)};']
+            # The target's declared type decides how a bare `infinity` in the
+            # RHS lowers -- Double.POSITIVE_INFINITY for a double target,
+            # Integer.MAX_VALUE otherwise. The decl path already does this
+            # through _with_type; without it here, `G[0] = infinity;` on a
+            # `double[] G` emitted Integer.MAX_VALUE, a finite 2147483647.
+            ltype = None
+            if s.lhs_field is None:
+                if new_idx is None:
+                    probe = Expr(kind='id', name=s.lhs_name)
+                elif new_idx2 is None:
+                    probe = Expr(kind='index', name=s.lhs_name, idx=new_idx)
+                else:
+                    probe = Expr(kind='index2', name=s.lhs_name, idx=new_idx,
+                                 rhs=new_idx2, idx_extra=new_extra)
+                ltype = self._expr_type(probe)
+            if ltype is not None:
+                rhs_src = self._with_type(ltype, lambda: self.gen_expr(new_rhs))
+            else:
+                rhs_src = self.gen_expr(new_rhs)
+            emitted = pre + [f'{indent}{lhs} = {rhs_src};']
+            # Lowering a priority key inside the advance makes that index a
+            # fresh candidate: push it with its NEW key, the way the classical
+            # heap-based Dijkstra does `H.add(k, d[k])` after each relaxation.
+            # The stale entry stays in the queue and is discarded when it
+            # surfaces and the guard rejects it.
+            if (self._in_advance and self.p.mode == 'heap'
+                    and self._container_field
+                    and s.lhs_field is None and new_idx is not None
+                    and new_idx2 is None
+                    and s.lhs_name == self._priority_array()):
+                k = self.gen_expr(new_idx)
+                emitted.append(f'{indent}if (_container != null) _container.add('
+                               f'new double[]{{priority({k}), {k}}});')
+            return emitted
         if s.kind == 'if' and getattr(self, '_uses_msgs', False):
             _inl = self._try_inline_pick_if(s, indent)
             if _inl is not None:
@@ -3003,10 +4021,20 @@ class CodeGen:
                 out.extend(self.gen_stmts(s.else_stmts, indent + '  '))
             out.append(f'{indent}}}')
             return out
+        if s.kind == 'break':
+            return [f'{indent}break;']
         if s.kind == 'while':
+            # `invariant` is a debugging aid: checked once before the loop
+            # runs at all, and again after every iteration completes (right
+            # before the condition is retested) -- the standard place a loop
+            # invariant must hold. An iteration that exits early via `break`
+            # or `return` skips that iteration's recheck; the common case of
+            # running to a normal (condition-false) exit is fully covered.
+            out = self._emit_assert_checks(s.invariants, indent)
             cond = self.gen_expr(s.cond)
-            out = [f'{indent}while ({cond}) {{']
+            out.append(f'{indent}while ({cond}) {{')
             out.extend(self.gen_stmts(s.body, indent + '  '))
+            out.extend(self._emit_assert_checks(s.invariants, indent + '  '))
             out.append(f'{indent}}}')
             return out
         if s.kind == 'forall':
@@ -3038,8 +4066,33 @@ class CodeGen:
                     self._scope_types.pop(s.loop_var, None)
             out.append(f'{indent}}}')
             return out
+        if s.kind == 'slice_assign':
+            # D[lo..hi] = SRC. The length comes from the destination range,
+            # which is inclusive, so hi-lo+1 elements move. A slice on the
+            # right contributes its own start offset; any other array
+            # expression starts at 0.
+            lo = self.gen_expr(s.slice_lo)
+            hi = self.gen_expr(s.slice_hi)
+            src = s.rhs
+            if src is not None and src.kind == 'slice':
+                src_name = src.name
+                src_off = self.gen_expr(src.slice_lo)
+            else:
+                src_name = self.gen_expr(src)
+                src_off = '0'
+            return [f'{indent}System.arraycopy({src_name}, {src_off}, '
+                    f'{s.lhs_name}, {lo}, ({hi}) - ({lo}) + 1);']
         if s.kind == 'decl':
             t = java_base_type(s.decl_type)
+            if s.decl_type.is_heap:
+                # A mid-body local heap; track it so gen_expr's 'method_call'
+                # case can recognise `h.push(...)` etc. -- _expr_type has no
+                # visibility into inline mid-body locals.  A heap declared at
+                # the TOP of a guard-bearing program's body is a field
+                # instead, and is seeded into _heap_vars by _emit_method /
+                # _emit_aux_method (see _HEAP_CTOR's own note).
+                self._heap_vars.add(s.decl_name)
+                return [f'{indent}{t} {s.decl_name} = {_HEAP_CTOR};']
             # Generate the RHS BEFORE the name enters scope, so quantifier
             # helpers triggered during RHS evaluation don't try to capture
             # an undefined `decl_name`.  Lift quantifiers in the init into
@@ -3050,7 +4103,16 @@ class CodeGen:
             rhs = None
             if s.decl_init is not None:
                 new_init = self._inline_quant_in_expr(s.decl_init, pre, indent)
-                rhs = self.gen_expr(new_init)
+                # The declared type decides how a bare `infinity` in the
+                # initialiser lowers, exactly as it does for an assignment
+                # (see the 'assign' case).  Without this, `double best =
+                # infinity;` in a method body emitted Integer.MAX_VALUE -- a
+                # finite 2147483647 -- so a "nothing selected" sentinel kept
+                # comparing and accumulating as an ordinary number instead of
+                # saturating, and an LLP fixpoint seeded with it never
+                # stopped changing.
+                rhs = self._with_type(s.decl_type,
+                                      lambda: self.gen_expr(new_init))
             # Local int/real/bool declared in a body becomes visible to the
             # rest of the enclosing stmt_list, so push it onto the quantifier
             # scope now.
@@ -3079,6 +4141,21 @@ class CodeGen:
                         # slot, index 0 directly -- sidesteps this.p.base's
                         # 0-/1-indexed loop-bound complexity entirely, which
                         # doesn't apply here since there's exactly one slot.
+                        # ...UNLESS the decl carries an explicit 0-based
+                        # range (`boolean[0..n-1] sel = false;`), which says
+                        # outright that this is a real n-slot array, not a
+                        # register. Size it as declared and fill it.
+                        if (s.decl_type.range1 is not None
+                                and s.decl_type.range1[0].kind == 'int'
+                                and s.decl_type.range1[0].value == 0):
+                            size = self._array_size_expr(s.decl_type)
+                            out = pre + [f'{indent}{t} {s.decl_name} = '
+                                         f'new {base}[{size}];']
+                            if rhs != java_zero(Type(s.decl_type.base)):
+                                out.append(
+                                    f'{indent}for (int _u = 0; _u < {size}; '
+                                    f'_u++) {s.decl_name}[_u] = {rhs};')
+                            return out
                         out = pre + [f'{indent}{t} {s.decl_name} = new {base}[1];']
                         if rhs != java_zero(Type(s.decl_type.base)):
                             out.append(f'{indent}{s.decl_name}[0] = {rhs};')
@@ -3142,12 +4219,30 @@ class CodeGen:
                 # would silently discard that intent instead of signaling
                 # it to the fixpoint loop.
                 return [f'{indent}return true;']
-            # `return X` -- early exit returning the operand.  The operand
-            # is mandatory in the new grammar, but defensive: if it's
-            # missing (legacy AST), emit `return;`.
+            # `return X` -- early exit returning the operand.  A bare
+            # `return;` (no operand) is only meaningful in a void method;
+            # anywhere else it would emit Java that does not compile, so
+            # say so here rather than letting javac report it.
+            if s.return_value is None and not self._in_void_method:
+                raise SyntaxError(
+                    '`return;` without an operand is only allowed in a void '
+                    'method; this method returns a value, so give it one '
+                    '(e.g. `return G;`)')
             if s.return_value is not None and not self._in_void_method:
-                return [f'{indent}return {self.gen_expr(s.return_value)};']
-            return [f'{indent}return;']
+                # Lift any quantifier out of the operand into preceding
+                # statements, for the same reason a `decl` init does: an
+                # aggregate left in place becomes a `_qN()` helper, and a
+                # helper only receives the enclosing quantifier variables
+                # as parameters -- it reads everything else (method params,
+                # method locals) by bare name, which resolves only when the
+                # program has guards and those names happen to have been
+                # promoted to fields.  Inlining keeps the loop in the
+                # enclosing method, where its free variables are in scope.
+                pre: List[str] = []
+                rv = self._inline_quant_in_expr(s.return_value, pre, indent)
+                pre.extend(self._emit_contract_ensures(indent))
+                return pre + [f'{indent}return {self.gen_expr(rv)};']
+            return self._emit_contract_ensures(indent) + [f'{indent}return;']
         if s.kind == 'guard':
             # Inline fixpoint loop using the helpers emitted by
             # _emit_all_guard_helpers.
@@ -3162,10 +4257,13 @@ class CodeGen:
                 # step() instead, which is what every mode drives.
                 self._step_guards.append(s)
                 return []
+            if s.guard_group and len(s.guard_group) > 1:
+                return self._emit_fixpoint_loop_multi(s.guard_group, indent)
             return self._emit_fixpoint_loop(f'_forbidden{g_id}',
                                             f'_advance{g_id}', pick, indent,
                                             indices=s.guard_index,
-                                            returns=self._advance_returns(s))
+                                            returns=self._advance_returns(s),
+                                            ranges=s.guard_ranges, guard=s)
         if s.kind == 'call':
             # Self-recursion to this program's entry method, OR a call to
             # an aux method declared in this class -- emit as a plain
@@ -3256,6 +4354,8 @@ class CodeGen:
         for s in stmts:
             if s.kind == 'guard':
                 yield s
+                for g in (s.guard_group or [])[1:]:
+                    yield g
             elif s.kind == 'par':
                 for b in s.par_branches:
                     for g in self._walk_guards([b]):
@@ -3266,6 +4366,9 @@ class CodeGen:
                 for g in self._walk_guards(s.else_stmts):
                     yield g
             elif s.kind == 'forall':
+                for g in self._walk_guards(s.body):
+                    yield g
+            elif s.kind == 'while':
                 for g in self._walk_guards(s.body):
                     yield g
             elif s.kind == 'block':
@@ -3418,7 +4521,8 @@ class CodeGen:
             if self.p.mode == 'linkedlist':
                 lines.append('  LinkedList<Integer> forbiddenList;')
             elif self.p.mode == 'heap':
-                lines.append('  PriorityQueue<Integer> forbiddenHeap;')
+                if self._container_field:
+                    lines.append('  java.util.PriorityQueue<double[]> _container;')
             elif self.p.mode == 'deque':
                 lines.append('  Deque<Integer> forbiddenDeque;')
             lines.append('')
@@ -3436,8 +4540,13 @@ class CodeGen:
         # A lone guard gets unnumbered `forbidden()`/`advance()` helpers, for
         # continuity with the v0 output.  A receive guard is excluded: it has
         # no predicate to emit, so it takes the general numbered path.
+        # A group of `&&`-joined rules is several guards wearing one
+        # statement, so it needs the numbered helpers even though the
+        # statement count is 1.
         self._single_guard = (
             len(self.p.stmts) == 1 and self.p.stmts[0].kind == 'guard'
+            and not (self.p.stmts[0].guard_group
+                     and len(self.p.stmts[0].guard_group) > 1)
             and not self._is_recv_guard(self.p.stmts[0]))
         self._guard_count = 0
         # Helper methods for guard statements must be defined in the class
@@ -3449,8 +4558,8 @@ class CodeGen:
             else:
                 self._emit_all_guard_helpers(lines, self.p.stmts)
         # priority method for heap mode
-        if self._has_guards and self.p.mode == 'heap':
-            lines.append('  private double priority(int j) {')
+        if self._has_guards and self.p.mode in ('heap', 'priority'):
+            lines.append(f'  private double priority({self._idx_params(self._heap_mode_indices())}) {{')
             lines.append(f'    return {self.gen_expr(self.p.priority_expr)};')
             lines.append('  }')
             lines.append('')
@@ -3513,6 +4622,110 @@ class CodeGen:
             return 'void'
         return java_base_type(self.p.return_type)
 
+    # ---- requires / ensures / old(...) ---------------------------------
+    #
+    # Both clauses lower to plain Java `assert`, so they cost nothing at
+    # runtime unless the JVM is run with -ea: `requires` becomes one assert
+    # right after the signature, before anything else runs; `ensures`
+    # becomes one assert right before every `return` (and, for a void
+    # method whose body can fall off the end, one more right before the
+    # closing brace). `old(expr)` is the one piece of real machinery: each
+    # distinct `old(...)` argument appearing in the method's `ensures`
+    # clauses is evaluated ONCE, into a snapshot local, before the body
+    # runs; every occurrence of `old(expr)` is then replaced by a
+    # reference to that local when the `ensures` check is emitted.
+
+    def _emit_assert_checks(self, exprs: List['Expr'], indent: str = '    ') -> List[str]:
+        # Inline any top-level quantifier rather than letting gen_expr hoist
+        # it into a separate `_qN()` helper: a helper sees only its own
+        # quantifier variables as parameters and otherwise assumes guard
+        # locals were promoted to fields, which a plain (non-guard) method's
+        # own params and locals never are -- exactly the reason the
+        # `return` case already does the same inlining below. Shared by
+        # `requires` (_emit_contract_requires), `invariant` (_emit_while),
+        # and -- via _emit_contract_ensures -- `ensures`.
+        out: List[str] = []
+        for e in exprs:
+            rv = self._inline_quant_in_expr(e, out, indent)
+            out.append(f'{indent}assert ({self.gen_expr(rv)});')
+        return out
+
+    def _emit_contract_requires(self, exprs: List['Expr']) -> List[str]:
+        return self._emit_assert_checks(exprs, '    ')
+
+    def _collect_old_args(self, exprs: List['Expr']) -> List['Expr']:
+        """Every distinct `old(...)` argument in exprs, in first-seen
+        order, deduped by its generated Java text."""
+        seen: dict = {}  # java text -> Expr, for stable iteration order
+
+        def walk(e):
+            if e is None or not hasattr(e, 'kind'):
+                return
+            if e.kind == 'call' and e.name == 'old':
+                if len(e.args) != 1:
+                    raise SyntaxError(
+                        '`old(...)` takes exactly one argument, '
+                        f'got {len(e.args)}')
+                key = self.gen_expr(e.args[0])
+                seen.setdefault(key, e.args[0])
+                return  # old(...) does not itself nest another old(...)
+            for fl in dataclasses.fields(e):
+                v = getattr(e, fl.name, None)
+                if isinstance(v, Expr):
+                    walk(v)
+                elif isinstance(v, list):
+                    for x in v:
+                        if isinstance(x, Expr):
+                            walk(x)
+
+        for e in exprs:
+            walk(e)
+        return list(seen.values())
+
+    def _substitute_old(self, e: 'Expr', old_map: dict) -> 'Expr':
+        """A copy of e with every `old(arg)` replaced by a reference to
+        the snapshot local old_map[gen_expr(arg)]."""
+        if e is None or not hasattr(e, 'kind'):
+            return e
+        if e.kind == 'call' and e.name == 'old':
+            return Expr(kind='id', name=old_map[self.gen_expr(e.args[0])])
+        new = dataclasses.replace(e)
+        for fl in dataclasses.fields(e):
+            v = getattr(e, fl.name, None)
+            if isinstance(v, Expr):
+                setattr(new, fl.name, self._substitute_old(v, old_map))
+            elif isinstance(v, list) and v and isinstance(v[0], Expr):
+                setattr(new, fl.name,
+                       [self._substitute_old(x, old_map) for x in v])
+        return new
+
+    def _emit_contract_preamble(self, lines: List[str], requires: List['Expr'],
+                                ensures: List['Expr']) -> List['Expr']:
+        """Emit the `requires` asserts and the `old(...)` snapshots (in that
+        order -- a precondition failure should fire before any snapshot is
+        even taken), and return `ensures` with every `old(...)` rewritten
+        to its snapshot local, ready for `_emit_contract_ensures`. Caller
+        is responsible for setting self._current_ensures to the result and
+        restoring it afterward (see _emit_aux_method / _emit_method)."""
+        lines.extend(self._emit_contract_requires(requires))
+        if not ensures:
+            return []
+        old_args = self._collect_old_args(ensures)
+        old_map: dict = {}
+        for i, arg in enumerate(old_args):
+            # Dedup key is gen_expr(arg) on the ORIGINAL (un-inlined) arg,
+            # matching _substitute_old's lookup below -- only the snapshot
+            # line itself needs the inlined form.
+            key = self.gen_expr(arg)
+            rv = self._inline_quant_in_expr(arg, lines, '    ')
+            var = f'__old{i}'
+            old_map[key] = var
+            lines.append(f'    final var {var} = {self.gen_expr(rv)};')
+        return [self._substitute_old(e, old_map) for e in ensures]
+
+    def _emit_contract_ensures(self, indent: str) -> List[str]:
+        return self._emit_assert_checks(self._current_ensures, indent)
+
     def _emit_aux_method(self, lines: List[str], m: 'Method') -> None:
         """Emit an auxiliary method with the user-supplied signature."""
         ret = 'void' if m.return_type is None else java_base_type(m.return_type)
@@ -3520,12 +4733,43 @@ class CodeGen:
             f'{java_base_type(d.type)} {d.name}' for d in m.params)
         modifier = 'static ' if self.noclass else ''
         lines.append(f'  public {modifier}{ret} {m.name}({sig}) {{')
+        if any(p.type.is_heap for p in m.params):
+            raise NotImplementedError(
+                f'heap<int> param in {m.name}: unsupported -- a heap var '
+                'must be allocated and consumed within one method body')
         # Aux methods get the scalar params in `_q_scope` so quantifier
         # helpers see the right values.
         self._q_scope = [
             p.name for p in m.params
             if not p.type.is_array and not p.type.is_2d and not p.type.is_set]
-        lines.extend(self.gen_stmts(m.body, '    '))
+        # Every param of this aux method is a local here; the non-scalar ones
+        # are exactly what a lifted quantifier may need captured.
+        self._local_types = {p.name: p.type for p in m.params}
+        # Heap FIELDS are visible here: an aux method called from the advance
+        # is exactly where a persistent heap gets used (release/claim helpers
+        # reaching the program's own occupied/free queues).
+        self._heap_vars = self._heap_field_names()
+        # A void aux method is where a bare `return;` is legal; record that
+        # for the duration of its body so _emit_stmt can tell the two cases
+        # apart (see the `return` branch there).
+        prev_void = self._in_void_method
+        self._in_void_method = m.return_type is None
+        prev_ensures = self._current_ensures
+        self._current_ensures = self._emit_contract_preamble(
+            lines, m.requires, m.ensures)
+        try:
+            lines.extend(self.gen_stmts(m.body, '    ', pop_scope=False))
+            # A void method's body may fall off the end rather than hit an
+            # explicit `return;` -- that is still an exit, so check there
+            # too. A non-void method cannot do this (javac requires every
+            # path to return a value), so gen_stmt's 'return' case alone
+            # covers it.
+            if (self._in_void_method and self._current_ensures
+                    and not (m.body and self._always_returns(m.body[-1]))):
+                lines.extend(self._emit_contract_ensures('    '))
+        finally:
+            self._in_void_method = prev_void
+            self._current_ensures = prev_ensures
         lines.append('  }')
         lines.append('')
 
@@ -3544,6 +4788,14 @@ class CodeGen:
             f'{java_base_type(d.type)} {d.name}' for d in self.p.params)
         modifier = 'static ' if self.noclass else ''
         lines.append(f'  public {modifier}{ret} {self.p.entry_name}({sig}) {{')
+        if self.p.ensures and self._has_guards:
+            raise NotImplementedError(
+                '`ensures` on a program with `forbidden`/`advance` guards '
+                'is not yet supported: a terminal rule can return from deep '
+                'inside the fixpoint-loop machinery, which this check does '
+                'not yet reach. `requires` alone is fully supported on such '
+                'programs.')
+        lines.extend(self._emit_contract_requires(self.p.requires))
         if self._has_guards or self.p.stateful:
             lines.extend(self._init_body_lines('    '))
         if self._has_guards:
@@ -3554,6 +4806,19 @@ class CodeGen:
         self._q_scope = [
             p.name for p in self.p.params
             if not p.type.is_array and not p.type.is_2d and not p.type.is_set]
+        self._local_types = {p.name: p.type for p in self.p.params}
+        if not (self._has_guards or self.p.stateful):
+            # Pure-method program: prog.decls are emitted as locals too.
+            self._local_types.update({d.name: d.type for d in self.p.decls})
+        # A guard-bearing (or stateful) program's top-of-body heap decls were
+        # emitted as fields and constructed by _init_body_lines above; seed
+        # them so the body can push/poll them like any other heap var.
+        self._heap_vars = self._heap_field_names()
+        if any(p.type.is_heap for p in self.p.params):
+            raise NotImplementedError(
+                'heap<int> entry-method param: unsupported -- pass the data '
+                'and let the program own its heap, or declare it at the top '
+                'of the body (a guard-bearing program makes that a field)')
         # For pure-method programs, emit the program's prog.decls as
         # locals at the top of the entry method.  Users must use explicit
         # `new T[expr]` allocations -- there is no auto-bound `n`.  A
@@ -3563,32 +4828,52 @@ class CodeGen:
         if not (self._has_guards or self.p.stateful):
             for d in self.p.decls:
                 lines.extend(self._emit_local_decl(d, '    '))
-        if self._single_guard:
-            g = self.p.stmts[0]
-            pick = g.guard_pick_var is not None
-            lines.extend(
-                self._emit_fixpoint_loop('forbidden', 'advance', pick,
-                                          '    ', indices=g.guard_index,
-                                          returns=self._advance_returns(g)))
-        else:
-            body_lines = self.gen_stmts(self.p.stmts, '    ')
-            pidx = self.p.process_index
-            if pidx and re.search(r'\b' + re.escape(pidx) + r'\b',
-                                   '\n'.join(body_lines)):
-                lines.append(f'    final int {pidx} = me;')
-            lines.extend(body_lines)
-        # Non-void methods need a trailing `return result_name;` because
-        # `_scan_result` strips the user-written trailing return so the
-        # body emission has the same shape as the v0 single-guard form.
-        if ret != 'void':
-            if self.p.result_name is not None:
-                lines.append(f'    return {self.p.result_name};')
-            elif not (self.p.stmts
-                      and self._always_returns(self.p.stmts[-1])):
-                # No result variable, and the body can fall off the end --
-                # every `return` is a literal inside a terminal rule.  Java
-                # needs a default there; reaching it means no rule fired.
-                lines.append(f'    return {java_zero(self.p.return_type)};')
+        # `ensures` setup (old-snapshots, if any) goes here: after decls/
+        # fields are in scope, right before the real work starts. Guards
+        # are impossible to reach this point with `ensures` set (checked
+        # above), so the plain-stmts `else` branch below is the only path
+        # ensures ever needs to cover for the entry method.
+        prev_ensures = self._current_ensures
+        self._current_ensures = self._emit_contract_preamble(
+            lines, [], self.p.ensures)
+        try:
+            if self._single_guard:
+                g = self.p.stmts[0]
+                pick = g.guard_pick_var is not None
+                lines.extend(
+                    self._emit_fixpoint_loop('forbidden', 'advance', pick,
+                                              '    ', indices=g.guard_index,
+                                              returns=self._advance_returns(g),
+                                              ranges=g.guard_ranges, guard=g))
+            else:
+                body_lines = self.gen_stmts(self.p.stmts, '    ', pop_scope=False)
+                pidx = self.p.process_index
+                if pidx and re.search(r'\b' + re.escape(pidx) + r'\b',
+                                       '\n'.join(body_lines)):
+                    lines.append(f'    final int {pidx} = me;')
+                lines.extend(body_lines)
+            # Non-void methods need a trailing `return result_name;` because
+            # `_scan_result` strips the user-written trailing return so the
+            # body emission has the same shape as the v0 single-guard form.
+            if ret != 'void':
+                if self.p.result_name is not None:
+                    lines.extend(self._emit_contract_ensures('    '))
+                    lines.append(f'    return {self.p.result_name};')
+                elif not (self.p.stmts
+                          and self._always_returns(self.p.stmts[-1])):
+                    # No result variable, and the body can fall off the end --
+                    # every `return` is a literal inside a terminal rule.  Java
+                    # needs a default there; reaching it means no rule fired.
+                    lines.extend(self._emit_contract_ensures('    '))
+                    lines.append(f'    return {java_zero(self.p.return_type)};')
+            elif (self._current_ensures
+                  and not (self.p.stmts
+                           and self._always_returns(self.p.stmts[-1]))):
+                # A void entry method whose body can fall off the end --
+                # same reasoning as the aux-method case in _emit_aux_method.
+                lines.extend(self._emit_contract_ensures('    '))
+        finally:
+            self._current_ensures = prev_ensures
         lines.append('  }')
         lines.append('')
         self._emit_step(lines)
@@ -3873,21 +5158,50 @@ class CodeGen:
                        f'{target}[_u][_v] = {rhs};')
         return out
 
+    def _heap_field_names(self) -> set:
+        """Names of the program's `heap<int>` decls -- the ones that become
+        fields on a guard-bearing or stateful program and so outlive a single
+        advance.  Seeded into `_heap_vars` by the entry- and aux-method
+        emitters so `h.push(...)` on a field resolves the same way it does on
+        a mid-body local."""
+        return {d.name for d in self.p.decls if d.type.is_heap}
+
     def _emit_local_decl(self, d: 'Decl', indent: str) -> List[str]:
         """Emit a `prog.decl` as a local variable inside the entry method.
         Mirrors the field-init logic from `_emit_ctors` but produces locals
         (no `this.`)."""
+        if d.type.is_heap:
+            # A guard-free (pure-method) program has no fields at all, so a
+            # top-of-body heap is just a local here -- its lifetime is the one
+            # method call either way.  Guard-bearing programs take the field
+            # path in _init_body_lines / _emit_ctors instead.
+            self._heap_vars.add(d.name)
+            return [f'{indent}{java_base_type(d.type)} {d.name} = {_HEAP_CTOR};']
         out: List[str] = []
         init = d.init
+        # Lift any aggregate in the initialiser into loops placed before the
+        # declaration, exactly as gen_stmt's 'decl' case does.  Left in
+        # place it would become a `_qN()` helper, and a helper is handed
+        # only the enclosing quantifier variables -- it reads the entry
+        # method's parameters by bare name, which resolves solely because a
+        # *guard-bearing* program promotes them to fields.  This emitter is
+        # the guard-free path, where nothing is promoted, so the helper
+        # would not compile.  `_is_wholesale_init` is still asked about the
+        # original `d.init`: after lifting, a `map`/`filter` has become a
+        # plain identifier and would otherwise be mistaken for a scalar to
+        # broadcast-fill.
+        pre: List[str] = []
+        if init is not None:
+            init = self._inline_quant_in_expr(init, pre, indent)
         t = java_base_type(d.type)
         if d.type.is_list:
             if d.type.is_array or d.type.is_2d:
-                return self._emit_list_array_alloc(d.name, d, indent,
-                                                   decl=t + ' ')
+                return pre + self._emit_list_array_alloc(d.name, d, indent,
+                                                         decl=t + ' ')
             out.append(f'{indent}{t} {d.name} = new LinkedList<>();')
-            return out
+            return pre + out
         if d.type.is_set or d.type.is_2d:
-            if d.type.is_2d and not _is_wholesale_init(init) and init is not None:
+            if d.type.is_2d and not _is_wholesale_init(d.init) and init is not None:
                 out.extend(self._emit_2d_alloc(d.name, d, indent, decl=t + ' '))
             elif init is not None:
                 rhs = self._with_type(d.type, lambda: self.gen_expr(init))
@@ -3895,7 +5209,7 @@ class CodeGen:
             else:
                 out.append(f'{indent}{t} {d.name};')
         elif d.type.is_array:
-            if init is not None and _is_wholesale_init(init):
+            if init is not None and _is_wholesale_init(d.init):
                 # Was `init.kind in ('method_call', 'new_array')` -- a
                 # narrower, independent check than _is_wholesale_init
                 # (used everywhere else in this file for the identical
@@ -3917,11 +5231,28 @@ class CodeGen:
                 # idiom (only ever indexed at [0]), e.g. ClosestPair's
                 # `double[] G = infinity;`.  One slot, index 0 directly.
                 elem = java_base_type(Type(d.type.base, False))
-                out.append(f'{indent}{t} {d.name} = new {elem}[1];')
-                if init is not None:
-                    rhs = self._with_type(d.type, lambda: self.gen_expr(init))
-                    if rhs != java_zero(d.type):
-                        out.append(f'{indent}{d.name}[0] = {rhs};')
+                # An explicit 0-based range overrides the register reading:
+                # `boolean[0..n-1] sel;` is an n-slot array even when it is
+                # the method's leading declaration.
+                if (d.type.range1 is not None
+                        and d.type.range1[0].kind == 'int'
+                        and d.type.range1[0].value == 0):
+                    size = self._array_size_expr(d.type)
+                    out.append(f'{indent}{t} {d.name} = new {elem}[{size}];')
+                    if init is not None:
+                        rhs = self._with_type(
+                            d.type, lambda: self.gen_expr(init))
+                        if rhs != java_zero(d.type):
+                            out.append(
+                                f'{indent}for (int _u = 0; _u < {size}; _u++) '
+                                f'{d.name}[_u] = {rhs};')
+                else:
+                    out.append(f'{indent}{t} {d.name} = new {elem}[1];')
+                    if init is not None:
+                        rhs = self._with_type(
+                            d.type, lambda: self.gen_expr(init))
+                        if rhs != java_zero(d.type):
+                            out.append(f'{indent}{d.name}[0] = {rhs};')
         else:
             if init is not None:
                 rhs = self._with_type(d.type, lambda: self.gen_expr(init))
@@ -3930,7 +5261,7 @@ class CodeGen:
                 out.append(f'{indent}{t} {d.name} = {java_zero(d.type)};')
         if d.type.base in ('int', 'double') and not d.type.is_array:
             self._q_scope.append(d.name)
-        return out
+        return pre + out
 
     def _array_size_expr(self, t: 'Type') -> str:
         """The Java size to allocate an array field with, for the codegen
@@ -3961,7 +5292,22 @@ class CodeGen:
         body: List[str] = []
         for d in self.p.params:
             body.append(f'{indent}this.{d.name} = {d.name};')
-        if self.primary_array is not None:
+        # An explicit scalar `n` parameter (e.g. a program taking both a
+        # vertex count and edge-indexed arrays, where no 1-D array's own
+        # length equals the vertex count) already got its correct value
+        # from the per-param assignment just above -- the array-length
+        # guess below exists for programs with no such explicit `n`, and
+        # must not clobber one that's already right.
+        # A program may also bind n itself, as a top-of-body decl
+        # (`int n = pref.length;`) -- that is emitted by the decls loop
+        # below, so the guess here must stand aside for it too, or the
+        # entry method gets two `this.n = ...` lines in a row.
+        has_explicit_n = (any(p.name == 'n' and not p.type.is_array
+                              for p in self.p.params)
+                          or any(d.name == 'n' for d in self.p.decls))
+        if has_explicit_n:
+            pass
+        elif self.primary_array is not None:
             suffix = ' - 1' if self.p.base == 1 else ''
             body.append(f'{indent}this.n = {self.primary_array.name}.length{suffix};')
         elif any(p.name == 'hi' for p in self.p.params):
@@ -3977,25 +5323,35 @@ class CodeGen:
             # arrays (G, fixed, ...) at length 0 -- confirmed to crash on
             # the first array access.
             #
-            # Restricted to a 2D array actually named `pre`, rather than
-            # just the first 2D array found: tried unconditionally first,
-            # and it newly turned ConstrainedStableMatching from a
-            # harmless no-op (n stuck at 0, so its forbidden/advance loop
-            # never ran at all) into a crash -- its forbidden predicate
-            # is already documented, in its own header comment, as an
-            # incomplete encoding (the book's third disjunct "is not
-            # expressible in the LL compiler; it is omitted here"), and
-            # empirically overruns its own preference lists under nearly
-            # every tested input, not just a synthesized one. Waking up
-            # a program the compiler's own comments admit is incomplete
-            # is a regression, not a fix, so this stays scoped to the one
-            # param name (`pre`) actually confirmed to need it.
-            pre_2d = next((p for p in self.p.params
-                           if p.type.is_2d and p.name == 'pre'), None)
-            if pre_2d is not None:
-                body.append(f'{indent}this.n = {pre_2d.name}.length;')
+            # Falls back to the first 2D parameter. This used to be scoped
+            # to a 2D param actually NAMED `pre`, to avoid waking
+            # ConstrainedStableMatching -- whose forbidden predicate its own
+            # header documents as an incomplete encoding of the book's rule --
+            # from a harmless no-op into a crash. But leaving n unbound is not
+            # harmless: it silently allocates G empty and skips the fixpoint
+            # entirely, so LLP-LexMatchVertexCover, LLP-LexGreedySetCover and
+            # LLP-FloydWarshall all shipped returning an empty result for
+            # every input. A program that cannot be run correctly should fail
+            # loudly, not return nothing quietly, so the binding is general
+            # and the incomplete program is the thing to fix.
+            any_2d = next((p for p in self.p.params if p.type.is_2d), None)
+            if any_2d is not None:
+                # Same base-1 adjustment the 1-D branch above makes: under
+                # setBase(1) the indices are 1..n and slot 0 is unused, so
+                # the array is n+1 long. Without it a base-1 program with
+                # only 2-D parameters ran its loops to mpref.length and
+                # indexed one past the end -- exactly the `int n =
+                # mpref.length - 1;` this comment already cites from
+                # GaleShapley.match.
+                suffix = ' - 1' if self.p.base == 1 else ''
+                body.append(f'{indent}this.n = {any_2d.name}.length{suffix};')
         for d in self.p.decls:
             init = d.init
+            if d.type.is_heap:
+                # Persists for the whole run, so the advance can poll a queue
+                # another advance filled -- see _HEAP_CTOR.
+                body.append(f'{indent}this.{d.name} = {_HEAP_CTOR};')
+                continue
             if d.type.is_list:
                 if d.type.is_array or d.type.is_2d:
                     body.extend(self._emit_list_array_alloc(
@@ -4062,16 +5418,10 @@ class CodeGen:
                 f'{indent}for (int j = {self._loop_lo}; j {self._loop_cmp} {self._loop_hi}; j++) '
                 f'forbiddenList.add(j);')
         elif self.p.mode == 'heap':
-            body.append(f'{indent}forbiddenHeap = new PriorityQueue<>(')
-            if self.p.priority_order == 'max':
-                body.append(
-                    f'{indent}  (a, b) -> Double.compare(priority(b), priority(a)));')
-            else:
-                body.append(
-                    f'{indent}  (a, b) -> Double.compare(priority(a), priority(b)));')
-            body.append(
-                f'{indent}for (int j = {self._loop_lo}; j {self._loop_cmp} {self._loop_hi}; j++) '
-                f'forbiddenHeap.add(j);')
+            # Nothing to pre-populate: the fixpoint loop re-selects the
+            # extremal-priority forbidden index each round (see
+            # _emit_fixpoint_loop), so there is no standing queue to seed.
+            pass
         elif self.p.mode == 'deque':
             body.append(f'{indent}forbiddenDeque = new ArrayDeque<>();')
             body.append(
@@ -4097,24 +5447,27 @@ class CodeGen:
                 body.append(f'    this.{d.name} = {d.name};')
             if self._uses_msgs:
                 self._emit_chan_init(body)
-            if self.primary_array is not None:
+            if any(p.name == 'n' and not p.type.is_array for p in self.p.params) \
+                    or any(d.name == 'n' for d in self.p.decls):
+                pass                      # the program binds n itself
+            elif self.primary_array is not None:
                 body.append(f'    this.n = {self.primary_array.name}.length - 1;')
                 body.append('    if (n < 0) n = 0;')
             elif any(p.name == 'hi' for p in self.p.params):
                 body.append('    this.n = hi;')
             else:
-                # See the sibling ctor path (_init_body_lines) above for
-                # why this fallback exists, and why it is restricted to a
-                # 2D array actually named `pre` -- same reasoning, kept
-                # consistent across both emitter modes.
-                pre_2d = next((p for p in self.p.params
-                               if p.type.is_2d and p.name == 'pre'), None)
-                if pre_2d is not None:
-                    body.append(f'    this.n = {pre_2d.name}.length;')
+                # See the sibling ctor path (_init_body_lines) above -- same
+                # reasoning, kept consistent across both emitter modes.
+                any_2d = next((p for p in self.p.params if p.type.is_2d), None)
+                if any_2d is not None:
+                    body.append(f'    this.n = {any_2d.name}.length;')
             for d in self.p.decls:
                 if include_result and d.name == self.p.result_name:
                     continue
                 init = d.init
+                if d.type.is_heap:
+                    body.append(f'    this.{d.name} = {_HEAP_CTOR};')
+                    continue
                 if d.type.is_list:
                     body.append(f'    this.{d.name} = new LinkedList<>();')
                     continue
@@ -4165,16 +5518,7 @@ class CodeGen:
                 elif self.p.mode == 'array':
                     body.append('    forbiddenArr = new boolean[n + 1];')
                 elif self.p.mode == 'heap':
-                    body.append('    forbiddenHeap = new PriorityQueue<>(')
-                    if self.p.priority_order == 'max':
-                        body.append(
-                            '      (a, b) -> Double.compare(priority(b), priority(a)));')
-                    else:
-                        body.append(
-                            '      (a, b) -> Double.compare(priority(a), priority(b)));')
-                    body.append(
-                        f'    for (int j = {self._loop_lo}; j <= {self._loop_hi}; j++) '
-                        'forbiddenHeap.add(j);')
+                    body.extend(self._emit_heap_init_lines('    '))
             # If the constructor would be entirely empty, omit it -- Java's
             # default no-arg constructor is sufficient.
             if not body and not ctor_decls:
@@ -4198,6 +5542,51 @@ class CodeGen:
     def _idx_params(indices: List[str]) -> str:
         """Build Java parameter list from guard indices, e.g. 'int i, int j'."""
         return ', '.join(f'int {v}' for v in indices)
+
+    def _heap_mode_indices(self) -> List[str]:
+        """The index variables of the guard that `setMode(PriorityQueue)`
+        schedules -- heap mode supports exactly one guard (the program's
+        main forbidden/advance rule), found the same way `_has_guards`
+        does. Defaults to `['j']` (the pre-existing single-index-only
+        behavior) if, somehow, no guard is found, so a malformed program
+        fails the same way it always did rather than crashing here."""
+        g = next(self._walk_guards(self.p.stmts), None)
+        if g is not None and g.guard_index:
+            return list(g.guard_index)
+        return ['j']
+
+    def _emit_heap_init_lines(self, indent: str) -> List[str]:
+        """Comparator construction + initial population for `forbiddenHeap`.
+        For a single-index guard this is unchanged from before (a flat
+        `PriorityQueue<Integer>`, one int per candidate). A multi-index
+        guard (e.g. `forbidden(i, j)`) instead holds `int[]` tuples --
+        one per combination of every index's full range -- compared by
+        unpacking each tuple into `priority(...)`'s now-multi-arg
+        signature, and populated via a chain of nested `for` loops (one
+        per index, Java's own single-statement-body nesting needs no
+        braces between them)."""
+        indices = self._heap_mode_indices()
+        out = [f'{indent}forbiddenHeap = new PriorityQueue<>(']
+        if len(indices) > 1:
+            unpack_a = ', '.join(f'a[{k}]' for k in range(len(indices)))
+            unpack_b = ', '.join(f'b[{k}]' for k in range(len(indices)))
+        else:
+            unpack_a, unpack_b = 'a', 'b'
+        if self.p.priority_order == 'max':
+            out.append(f'{indent}  (a, b) -> Double.compare(priority({unpack_b}), priority({unpack_a})));')
+        else:
+            out.append(f'{indent}  (a, b) -> Double.compare(priority({unpack_a}), priority({unpack_b})));')
+        if len(indices) > 1:
+            for_chain = ' '.join(
+                f'for (int {v} = {self._loop_lo}; {v} {self._loop_cmp} {self._loop_hi}; {v}++)'
+                for v in indices)
+            add_args = ', '.join(indices)
+            out.append(f'{indent}{for_chain} forbiddenHeap.add(new int[]{{{add_args}}});')
+        else:
+            out.append(
+                f'{indent}for (int j = {self._loop_lo}; j {self._loop_cmp} {self._loop_hi}; j++) '
+                f'forbiddenHeap.add(j);')
+        return out
 
     def _emit_always_vars(self, lines: List[str], g: Stmt,
                           indent: str = '    ') -> None:
@@ -4268,11 +5657,8 @@ class CodeGen:
             self._emit_always_vars(lines, g)
             body: List[str] = []
             if not self._emit_pred_procedural(g.guard_predicate, body, '    '):
-                pre: List[str] = []
-                new_pred = self._inline_quant_in_expr(
-                    g.guard_predicate, pre, '    ')
-                body.extend(pre)
-                body.append(f'    return {self.gen_expr(new_pred)};')
+                body.extend(self._emit_conjunctive_guard(
+                    g.guard_predicate, '    '))
             lines.extend(body)
             lines.append('  }')
             lines.append('')
@@ -4413,8 +5799,10 @@ class CodeGen:
         void, which decides how a `return` inside it is emitted."""
         prev = self._in_void_method
         prev_stop = self._void_stop_signal
+        prev_adv = self._in_advance
         self._in_void_method = void
         self._void_stop_signal = void and self._void_stop_mode
+        self._in_advance = True
         try:
             if adv.kind == 'block':
                 return self.gen_stmts(adv.body, indent)
@@ -4422,6 +5810,7 @@ class CodeGen:
         finally:
             self._in_void_method = prev
             self._void_stop_signal = prev_stop
+            self._in_advance = prev_adv
 
     def _emit_all_guard_helpers(self, lines: List[str], stmts: List[Stmt]) -> None:
         """Assign each guard in the program a numeric id K and emit a
@@ -5480,7 +6869,7 @@ class CodeGen:
             if e.kind == 'quant' and getattr(e, 'pick_var', None):
                 if e.pick_var not in found:
                     found.append(e.pick_var)
-            for a in ('lhs', 'rhs', 'idx', 'q_body', 'q_lo', 'q_hi', 'q_set'):
+            for a in ('lhs', 'rhs', 'idx', 'q_body', 'q_lo', 'q_hi', 'q_set', 'q_where'):
                 walk(getattr(e, a, None))
             for a in (getattr(e, 'args', None) or []):
                 walk(a)
@@ -5500,7 +6889,7 @@ class CodeGen:
             if e.kind == 'quant' and getattr(e, 'pick_var', None):
                 found[e.pick_var] = (self._elem_java_type(e.q_set)
                                      if e.q_set is not None else 'int')
-            for a in ('lhs', 'rhs', 'idx', 'q_body', 'q_lo', 'q_hi', 'q_set'):
+            for a in ('lhs', 'rhs', 'idx', 'q_body', 'q_lo', 'q_hi', 'q_set', 'q_where'):
                 expr(getattr(e, a, None))
             for a in (getattr(e, 'args', None) or []):
                 expr(a)
@@ -5543,10 +6932,243 @@ class CodeGen:
         return (f'{self._boxed_result()} _r = {aname}(); '
                 f'if (_r != {sig}) return _r;')
 
+    def _loop_header(self, var: str, rng, indent: str) -> str:
+        """The for-loop header scanning one guard index.
+
+        `rng` is that index's own (lo, hi) when the guard gave it one --
+        `forbidden (i in [1..n], c in [1..W])` -- and None when it falls
+        back to the program-wide bound.  Per-index ranges matter whenever
+        a guard's indices range over different things: without them
+        LLP-Knapsack's capacity c would be scanned to n, the item count."""
+        if rng is not None:
+            lo = self.gen_expr(rng[0])
+            test = self._for_loop_test(var, rng[1])
+            return f'{indent}for (int {var} = {lo}; {test}; {var}++) {{'
+        return (f'{indent}for (int {var} = {self._loop_lo}; '
+                f'{var} {self._loop_cmp} {self._loop_hi}; {var}++) {{')
+
+
+    # ----------------------------------------------------------------
+    # dependList analysis (Algorithm LLP-Sequential, Section 2.6)
+    #
+    # The book's sequential LLP algorithm keeps a set S of candidate
+    # indices and, after advancing j, re-arms only `dependList(j)` --
+    # "indices whose forbidden status may change when G[j] changes".
+    # The naive alternative is to rescan every index after every sweep,
+    # which costs (number of sweeps) x (n + m); the number of sweeps is
+    # the longest dependency chain *in index order* and can be n, so a
+    # program whose stated bound is O(n+m) silently becomes O(n(n+m)).
+    #
+    # We recover dependList from the guard's syntax, so no program has to
+    # declare it. dep[r] is built as { k : guard(k) reads a cell that the
+    # advance writes at r }, which is exactly the transpose of the read
+    # relation, and is computed once in O(n + m).
+    #
+    # Recognised read shapes, with the source tuple each contributes:
+    #   A[j]        -- the guard's own index      ('self',)
+    #   A[i], i in S[j]                           ('set', 'S')
+    #   A[j +/- c]  -- constant offset            ('offset', c)
+    #   A[p[j]]     -- an index array             ('array', 'p')
+    # Anything else (notably `exists i in [0..n-1]`, which reads the whole
+    # vector and so has no locality to exploit) yields None, and the
+    # caller keeps the rescan. Soundness rests on the converse: if k is
+    # not in S and is not forbidden, it can only become forbidden when a
+    # cell it reads changes, and every such change pushes k.
+    # ----------------------------------------------------------------
+
+    def _advance_written(self, s: Optional['Stmt'], j: str,
+                         out: set) -> bool:
+        """Collect the arrays the advance writes, requiring that every
+        write lands on index `j`. A write anywhere else (a forall over
+        neighbours, a swap, a scalar field) moves components the worklist
+        would not know to re-arm, so we refuse those."""
+        if s is None:
+            return True
+        if isinstance(s, list):
+            return all(self._advance_written(x, j, out) for x in s)
+        k = s.kind
+        if k == 'assign':
+            if s.lhs_field is not None or s.lhs_index2 is not None \
+                    or s.lhs_index_extra:
+                return False
+            if s.lhs_index is None:
+                return False          # scalar write: may be read by the guard
+            if not (s.lhs_index.kind == 'id' and s.lhs_index.name == j):
+                return False
+            out.add(s.lhs_name)
+            return True
+        if k == 'decl':
+            return True               # a local, not program state
+        if k == 'block':
+            return self._advance_written(s.body, j, out)
+        if k == 'if':
+            return (self._advance_written(s.then_stmts, j, out)
+                    and self._advance_written(s.else_stmts, j, out))
+        return False
+
+    def _scan_guard_reads(self, e: Optional['Expr'], j: str, written: set,
+                          srcs: list, bound: dict) -> bool:
+        """Walk the guard, recording how each read of a written array is
+        addressed. Returns False as soon as one read is not local."""
+        if e is None:
+            return True
+        if e.kind == 'index' and e.name in written:
+            sub = e.idx
+            if sub is None or e.idx2 is not None or e.idx_extra:
+                return False
+            if sub.kind == 'id' and sub.name == j:
+                srcs.append(('self',))
+            elif sub.kind == 'id' and sub.name in bound:
+                src = bound[sub.name]
+                if src is None:
+                    return False      # quantified over a plain range
+                srcs.append(src)
+            elif (sub.kind == 'bin' and sub.op in ('+', '-')
+                  and sub.lhs is not None and sub.lhs.kind == 'id'
+                  and sub.lhs.name == j
+                  and sub.rhs is not None and sub.rhs.kind == 'int'):
+                c = int(sub.rhs.value)
+                srcs.append(('offset', c if sub.op == '+' else -c))
+            elif (sub.kind == 'index' and sub.idx is not None
+                  and sub.idx.kind == 'id' and sub.idx.name == j
+                  and sub.idx2 is None and sub.name not in written):
+                srcs.append(('array', sub.name))
+            else:
+                return False
+            # fall through: the subscript itself may contain more reads
+        if e.kind == 'quant':
+            q_src = None
+            if (e.q_set is not None and e.q_set.kind == 'index'
+                    and e.q_set.idx is not None
+                    and e.q_set.idx.kind == 'id' and e.q_set.idx.name == j
+                    and e.q_set.idx2 is None):
+                q_src = ('set', e.q_set.name)
+            inner = dict(bound)
+            inner[e.q_var] = q_src
+            if not self._scan_guard_reads(e.q_set, j, written, srcs, bound):
+                return False
+            for part in (e.q_body, e.q_where, e.q_lo, e.q_hi):
+                if not self._scan_guard_reads(part, j, written, srcs, inner):
+                    return False
+            return True
+        for part in (e.lhs, e.rhs, e.idx, e.idx2, e.slice_lo, e.slice_hi):
+            if not self._scan_guard_reads(part, j, written, srcs, bound):
+                return False
+        for part in list(e.args) + list(e.idx_extra):
+            if not self._scan_guard_reads(part, j, written, srcs, bound):
+                return False
+        return True
+
+    def _depend_sources(self, g: Optional['Stmt']) -> Optional[list]:
+        """The dependList sources for a single-index guard, or None when
+        the guard has no exploitable locality."""
+        if g is None or g.kind != 'guard' or g.guard_predicate is None:
+            return None
+        if g.guard_always:
+            return None               # `always` may hoist reads we do not see
+        idx = g.guard_index or ['j']
+        if len(idx) != 1:
+            return None               # multi-index guards keep the rescan
+        j = idx[0]
+        written: set = set()
+        if not self._advance_written(g.guard_advance, j, written):
+            return None
+        if not written:
+            return None
+        srcs: list = []
+        if not self._scan_guard_reads(g.guard_predicate, j, written,
+                                      srcs, {}):
+            return None
+        uniq: list = []
+        for s in srcs:
+            if s not in uniq:
+                uniq.append(s)
+        # A guard that only ever reads its own cell needs no worklist: no
+        # advance can make another index forbidden, so one pass suffices
+        # and the rescan already does that.
+        if not uniq or uniq == [('self',)]:
+            return None
+        return uniq
+
+    def _emit_dep_build(self, I: str, rng, srcs: list) -> List[str]:
+        """Build dep[], the transpose of the guard's read relation, in
+        O(n + m): count how many indices read each cell, allocate exactly,
+        then fill. Two passes over int[] rather than one over a list of
+        lists, since this runs on the hot path of every program that gets
+        a worklist."""
+        out: List[str] = []
+        out.append(f'{I}  // dependList (Algorithm LLP-Sequential): dep[r] holds')
+        out.append(f'{I}  // every index whose guard reads a cell written at r.')
+        out.append(f'{I}  int[] _dc = new int[n];')
+        for pazz in (0, 1):
+            out.append(self._loop_header('_k', rng, I + '  '))
+            for s in srcs:
+                body = ('_dc[%s]++;' if pazz == 0
+                        else '_dep[%s][_df[%s]++] = _k;')
+                if s[0] == 'self':
+                    hit = body % (('_k',) if pazz == 0 else ('_k', '_k'))
+                    out.append(f'{I}    {hit}')
+                elif s[0] == 'set':
+                    hit = body % (('_r',) if pazz == 0 else ('_r', '_r'))
+                    out.append(f'{I}    for (int _r : {s[1]}[_k]) '
+                               f'if (_r >= 0 && _r < n) {hit}')
+                else:
+                    expr = (f'_k + ({s[1]})' if s[0] == 'offset'
+                            else f'{s[1]}[_k]')
+                    hit = body % (('_r',) if pazz == 0 else ('_r', '_r'))
+                    out.append(f'{I}    {{ int _r = {expr}; '
+                               f'if (_r >= 0 && _r < n) {hit} }}')
+            out.append(f'{I}  }}')
+            if pazz == 0:
+                out.append(f'{I}  int[][] _dep = new int[n][];')
+                out.append(f'{I}  for (int _r = 0; _r < n; _r++) '
+                           f'_dep[_r] = new int[_dc[_r]];')
+                out.append(f'{I}  int[] _df = new int[n];')
+        return out
+
+    def _emit_worklist_loop(self, fname: str, aname: str, indent: str,
+                            var: str, rng, returns: bool,
+                            srcs: list) -> List[str]:
+        """Algorithm LLP-Sequential with S as a FIFO of candidate indices.
+
+        dep[r] is the transpose of the guard's read relation, so after
+        advancing j only the indices that actually read a cell j writes
+        are re-armed. `_inq` keeps S a set, which bounds it by n and lets
+        the queue be a fixed int ring buffer rather than a boxed deque.
+
+        As the book notes, S may hold indices that are not forbidden;
+        those are simply skipped, which is the `continue` below."""
+        out: List[str] = []
+        I = indent
+        out.append(f'{I}{{')
+        out.extend(self._emit_dep_build(I, rng, srcs))
+        out.append(f'{I}  int[] _q = new int[n + 1];')
+        out.append(f'{I}  boolean[] _inq = new boolean[n];')
+        out.append(f'{I}  int _qh = 0, _qt = 0;')
+        out.append(self._loop_header(var, rng, I + '  '))
+        out.append(f'{I}    _q[_qt++] = {var}; _inq[{var}] = true;')
+        out.append(f'{I}  }}')
+        out.append(f'{I}  while (_qh != _qt) {{')
+        out.append(f'{I}    int {var} = _q[_qh]; '
+                   f'_qh = _qh + 1 == n + 1 ? 0 : _qh + 1; '
+                   f'_inq[{var}] = false;')
+        out.append(f'{I}    if (!{fname}({var})) continue;')
+        out.append(f'{I}    this.{var} = {var}; '
+                   f'{self._advance_call(aname, returns)}')
+        out.append(f'{I}    for (int _x : _dep[{var}]) if (!_inq[_x]) {{')
+        out.append(f'{I}      _inq[_x] = true; _q[_qt] = _x; '
+                   f'_qt = _qt + 1 == n + 1 ? 0 : _qt + 1;')
+        out.append(f'{I}    }}')
+        out.append(f'{I}  }}')
+        out.append(f'{I}}}')
+        return out
+
     def _emit_fixpoint_loop(self, fname: str, aname: str, pick: bool,
                              indent: str,
                              indices: Optional[List[str]] = None,
-                             returns: bool = False) -> List[str]:
+                             returns: bool = False,
+                             ranges: Optional[List] = None,
+                             guard: Optional['Stmt'] = None) -> List[str]:
         """Emit the mode-appropriate fixpoint loop that repeatedly calls
         `fname(j)` / `aname(j)` until no index is forbidden.  `forbidden`
         is always boolean now (pick-witness, when relevant, is stashed
@@ -5563,6 +7185,61 @@ class CodeGen:
         # calling advance() (which reads them as fields, not params).
         set_fields = ' '.join(f'this.{v} = {v};' for v in indices)
         out: List[str] = []
+        _srcs = self._depend_sources(guard) if guard is not None else None
+        _acy = self.p.acyclic_array
+        if (_acy and _srcs and len(indices) == 1
+                and any(s == ('set', _acy) for s in _srcs)):
+            # `setAcyclic(A)` promises the precedence graph has no cycle, so
+            # every index can be settled once, in topological order: when j
+            # comes off the queue all of its predecessors are already final,
+            # so one advance fixes it for good. Each index is dequeued once
+            # and each edge relaxed once, which is the O(n+m) the book claims
+            # for this shape (Section 2.6: "for job scheduling with acyclic
+            # prerequisites, initialize with jobs having no predecessors").
+            #
+            # Relaxing to a fixpoint instead -- which is all we can do without
+            # the promise -- costs O(n * m) here, because a vertex must be
+            # revisited every time a predecessor deepens.
+            _rl = list(ranges) if ranges else [None]
+            v = indices[0]
+            I = indent
+            out.append(f'{I}{{')
+            out.append(f'{I}  // topological order over {_acy}, declared acyclic')
+            out.append(f'{I}  int[] _indeg = new int[n];')
+            out.append(f'{I}  int[] _sc = new int[n];')
+            out.append(self._loop_header('_k', _rl[0], I + '  '))
+            out.append(f'{I}    for (int _i : {_acy}[_k]) if (_i >= 0 && _i < n) '
+                       f'{{ _indeg[_k]++; _sc[_i]++; }}')
+            out.append(f'{I}  }}')
+            out.append(f'{I}  int[][] _succ = new int[n][];')
+            out.append(f'{I}  for (int _i = 0; _i < n; _i++) '
+                       f'_succ[_i] = new int[_sc[_i]];')
+            out.append(f'{I}  int[] _sf = new int[n];')
+            out.append(self._loop_header('_k', _rl[0], I + '  '))
+            out.append(f'{I}    for (int _i : {_acy}[_k]) if (_i >= 0 && _i < n) '
+                       f'_succ[_i][_sf[_i]++] = _k;')
+            out.append(f'{I}  }}')
+            out.append(f'{I}  int[] _q = new int[n];')
+            out.append(f'{I}  int _qh = 0, _qt = 0, _seen = 0, _total = 0;')
+            out.append(self._loop_header('_k', _rl[0], I + '  '))
+            out.append(f'{I}    _total++; if (_indeg[_k] == 0) _q[_qt++] = _k;')
+            out.append(f'{I}  }}')
+            out.append(f'{I}  while (_qh != _qt) {{')
+            out.append(f'{I}    int {v} = _q[_qh++]; _seen++;')
+            out.append(f'{I}    if ({fname}({v})) {{ this.{v} = {v}; '
+                       f'{self._advance_call(aname, returns)} }}')
+            out.append(f'{I}    for (int _x : _succ[{v}]) '
+                       f'if (--_indeg[_x] == 0) _q[_qt++] = _x;')
+            out.append(f'{I}  }}')
+            out.append(f'{I}  if (_seen != _total) throw new IllegalArgumentException(')
+            out.append(f'{I}      "{_acy} has a cycle; setAcyclic promises it does not");')
+            out.append(f'{I}}}')
+            return out
+        if self.p.mode == 'array' and _srcs and len(indices) == 1:
+            _rl = list(ranges) if ranges else [None]
+            return self._emit_worklist_loop(fname, aname, indent,
+                                            indices[0], _rl[0], returns,
+                                            _srcs)
         if self.p.mode == 'array':
             # Wrap in a block so multiple fixpoint loops in the same
             # method don't conflict on `changed`.
@@ -5572,9 +7249,10 @@ class CodeGen:
             out.append(f'{indent}    changed = false;')
             # Emit nested for-loops, one per index variable.
             depth = len(indices)
+            rl = list(ranges) if ranges else [None] * depth
             for d, var in enumerate(indices):
                 pad = '    ' + '  ' * d
-                out.append(f'{indent}{pad}for (int {var} = {lo}; {var} {self._loop_cmp} {hi}; {var}++) {{')
+                out.append(self._loop_header(var, rl[d], indent + pad))
             inner_pad = '    ' + '  ' * depth
             out.append(f'{indent}{inner_pad}if ({fname}({call_args})) {{')
             out.append(f'{indent}{inner_pad}  {set_fields} '
@@ -5599,11 +7277,153 @@ class CodeGen:
             out.append(f'{indent}    }}')
             out.append(f'{indent}  }}')
             out.append(f'{indent}}}')
-        elif self.p.mode == 'heap':
-            out.append(f'{indent}while (!forbiddenHeap.isEmpty()) {{')
-            out.append(f'{indent}  int j = forbiddenHeap.poll();')
-            out.append(f'{indent}  if ({fname}({call_args})) {{ {set_fields} '
-                       f'{self._advance_call(aname, returns)} }}')
+        elif self._container_field:
+            # setContainer(PriorityQueue): hold the candidate indices in a
+            # binary heap keyed by setPriority's expression, exactly as the
+            # classical Dijkstra of Section~\ref{sec:dijkstra} holds (j, c)
+            # pairs ordered by c.
+            #
+            # Each entry stores the key it had when it was pushed, so the
+            # ordering never goes stale. Lowering a key does not sift an
+            # existing entry -- it pushes a NEW one, and the obsolete entry is
+            # discarded when it surfaces and the guard rejects it. That is the
+            # same lazy-deletion the book's own heap-based Dijkstra uses, and
+            # it is what keeps the whole loop at O(m log n) rather than the
+            # O(n) rescan a fresh scan per advance would cost.
+            out.append(f'{indent}java.util.PriorityQueue<double[]> _C = '
+                       f'new java.util.PriorityQueue<>(')
+            cmp_expr = ('Double.compare(b[0], a[0])'
+                        if self.p.priority_order == 'max'
+                        else 'Double.compare(a[0], b[0])')
+            out.append(f'{indent}    (a, b) -> {cmp_expr});')
+            out.append(f'{indent}this._container = _C;')
+            _seed = self._loop_header(
+                indices[0], (list(ranges)[0] if ranges else None), '')
+            _seed = _seed.strip().rstrip('{').strip()
+            out.append(f'{indent}{_seed} '
+                       f'_C.add(new double[]{{priority({indices[0]}), {indices[0]}}});')
+            out.append(f'{indent}while (!_C.isEmpty()) {{')
+            out.append(f'{indent}  int j = (int) _C.poll()[1];')
+            out.append(f'{indent}  if (!{fname}({call_args})) continue;')
+            out.append(f'{indent}  {set_fields} {self._advance_call(aname, returns)}')
+            out.append(f'{indent}}}')
+        elif self.p.mode == 'priority' and self._static_priority:
+            # A key that cannot change gives a fixed order, so sort the
+            # indices once and then sweep them in that order to a fixpoint.
+            # The general lowering below rescans all n indices on every
+            # advance to find the extremal one, which costs a factor of n:
+            # measured at exactly n^2 guard evaluations for
+            # LLP-WeightedIntervalScheduling, whose stated bound is O(n).
+            # Sweeping gives O(n) per sweep. Only forbidden indices are
+            # advanced either way, and the fixpoint does not depend on the
+            # order, so the answer is unchanged.
+            _rl = list(ranges) if ranges else [None] * len(indices)
+            out.append(f'{indent}java.util.List<int[]> _ord = '
+                       f'new java.util.ArrayList<>();')
+            for d, var in enumerate(indices):
+                out.append(self._loop_header(var, _rl[d], indent + '  ' * d))
+            inner = indent + '  ' * len(indices)
+            out.append(f'{inner}_ord.add(new int[]{{{", ".join(indices)}}});')
+            for d in range(len(indices) - 1, -1, -1):
+                out.append(f'{indent}{"  " * d}}}')
+            unpack_a = ', '.join(f'_a[{k}]' for k in range(len(indices)))
+            unpack_b = ', '.join(f'_b[{k}]' for k in range(len(indices)))
+            if self.p.priority_order == 'max':
+                unpack_a, unpack_b = unpack_b, unpack_a
+            out.append(f'{indent}_ord.sort((_a, _b) -> Double.compare('
+                       f'priority({unpack_a}), priority({unpack_b})));')
+            out.append(f'{indent}{{')
+            out.append(f'{indent}  boolean changed = true;')
+            out.append(f'{indent}  while (changed) {{')
+            out.append(f'{indent}    changed = false;')
+            out.append(f'{indent}    for (int[] _t : _ord) {{')
+            for k, var in enumerate(indices):
+                out.append(f'{indent}      int {var} = _t[{k}];')
+            out.append(f'{indent}      if ({fname}({call_args})) {{ {set_fields} '
+                       f'{self._advance_call(aname, returns)} changed = true; }}')
+            out.append(f'{indent}    }}')
+            out.append(f'{indent}  }}')
+            out.append(f'{indent}}}')
+        elif (self.p.mode == 'priority' and _srcs and len(indices) == 1):
+            # A key that changes as the program runs cannot be sorted once,
+            # but with a dependList we need not rescan for the extremal
+            # index either: hold the candidates in a heap keyed by the
+            # priority expression and re-arm only the dependents of each
+            # advance. Entries carry the key they were pushed with, so a
+            # stale one is simply rejected by the guard when it surfaces --
+            # the same lazy deletion the setContainer lowering uses.
+            _rl = list(ranges) if ranges else [None]
+            v = indices[0]
+            cmp_ = ('Double.compare(_a[0], _b[0])'
+                    if self.p.priority_order != 'max'
+                    else 'Double.compare(_b[0], _a[0])')
+            out.append(f'{indent}{{')
+            out.extend(self._emit_dep_build(indent, _rl[0], _srcs))
+            out.append(f'{indent}  java.util.PriorityQueue<double[]> _pq =')
+            out.append(f'{indent}      new java.util.PriorityQueue<>('
+                       f'(_a, _b) -> {cmp_});')
+            out.append(self._loop_header(v, _rl[0], indent + '  '))
+            out.append(f'{indent}    _pq.add(new double[]{{priority({v}), {v}}});')
+            out.append(f'{indent}  }}')
+            out.append(f'{indent}  while (!_pq.isEmpty()) {{')
+            out.append(f'{indent}    int {v} = (int) _pq.poll()[1];')
+            out.append(f'{indent}    if (!{fname}({v})) continue;')
+            out.append(f'{indent}    this.{v} = {v}; '
+                       f'{self._advance_call(aname, returns)}')
+            out.append(f'{indent}    for (int _x : _dep[{v}]) '
+                       f'_pq.add(new double[]{{priority(_x), _x}});')
+            out.append(f'{indent}  }}')
+            out.append(f'{indent}}}')
+        elif self.p.mode in ('heap', 'priority'):
+            # Select the extremal-priority FORBIDDEN index afresh each round.
+            #
+            # The obvious lowering -- fill a java.util.PriorityQueue with every
+            # index once and poll it to exhaustion -- is wrong whenever the
+            # priority expression reads state the advance writes, which is the
+            # interesting case. A PriorityQueue orders by the key an element
+            # had when it was inserted; it has no decrease-key, and nothing is
+            # ever re-inserted after an advance lowers a key. LLP-Dijkstra,
+            # whose priority is G[j], returned wrong distances on about a fifth
+            # of random graphs that way. Re-evaluating here costs a linear scan
+            # per advance instead of a log, and is correct for a priority that
+            # depends on anything. It also matches llcjs.py's
+            # _render_priority_next_index, so the two backends agree.
+            cmp_op = '>' if self.p.priority_order == 'max' else '<'
+            # Use the SAME per-index bounds the default rescan uses: a guard
+            # may restrict an index itself (`ensure (j in [1..n-1])`), and
+            # scanning outside that range calls forbidden() on indices the
+            # program never meant to test -- which read out of bounds.
+            _rl = list(ranges) if ranges else [None] * len(indices)
+            loops = [self._loop_header(v, _rl[d], '').strip().rstrip('{').strip()
+                     for d, v in enumerate(indices)]
+            out.append(f'{indent}while (true) {{')
+            if len(indices) > 1:
+                out.append(f'{indent}  int[] _best = null;')
+            else:
+                out.append(f'{indent}  int _best = -1;')
+            out.append(f'{indent}  double _bestKey = 0;')
+            pad = indent + '  '
+            for d, lp in enumerate(loops):
+                out.append(f'{pad}{"  " * d}{lp} {{')
+            inner = pad + '  ' * len(loops)
+            out.append(f'{inner}if (!{fname}({call_args})) continue;')
+            out.append(f'{inner}double _k = priority({", ".join(indices)});')
+            if len(indices) > 1:
+                out.append(f'{inner}if (_best == null || _k {cmp_op} _bestKey) '
+                           f'{{ _best = new int[]{{{", ".join(indices)}}}; _bestKey = _k; }}')
+            else:
+                out.append(f'{inner}if (_best < 0 || _k {cmp_op} _bestKey) '
+                           f'{{ _best = j; _bestKey = _k; }}')
+            for d in range(len(loops) - 1, -1, -1):
+                out.append(f'{pad}{"  " * d}}}')
+            if len(indices) > 1:
+                out.append(f'{indent}  if (_best == null) break;')
+                for k, var in enumerate(indices):
+                    out.append(f'{indent}  int {var} = _best[{k}];')
+            else:
+                out.append(f'{indent}  if (_best < 0) break;')
+                out.append(f'{indent}  int j = _best;')
+            out.append(f'{indent}  {set_fields} {self._advance_call(aname, returns)}')
             out.append(f'{indent}}}')
         elif self.p.mode == 'deque':
             out.append(f'{indent}while (!forbiddenDeque.isEmpty()) {{')
@@ -5612,6 +7432,62 @@ class CodeGen:
                        f'{self._advance_call(aname, returns)} }}')
             out.append(f'{indent}  else forbiddenDeque.addLast(j);')
             out.append(f'{indent}}}')
+        return out
+
+    def _emit_fixpoint_loop_multi(self, group: List['Stmt'],
+                                   indent: str) -> List[str]:
+        """One fixpoint shared by several `&&`-joined rules.
+
+        Each sweep tests every index against every rule, advancing on
+        whichever fires, and the loop repeats until no rule is forbidden
+        at any index.  That is the LLP semantics for a set of rules --
+        and it is what emitting the rules as separate loops does NOT
+        give you, since driving rule 1 to its own fixpoint before rule 2
+        runs can leave rule 1 forbidden again once rule 2 has moved G."""
+        lo, hi = self._loop_lo, self._loop_hi
+        indices = list(group[0].guard_index or ['j'])
+        call_args = ', '.join(indices)
+        set_fields = ' '.join(f'this.{v} = {v};' for v in indices)
+        rules = []
+        for g in group:
+            g_id = getattr(g, '_codegen_id', None)
+            if g_id is None:
+                raise ValueError('guard without codegen_id -- internal error')
+            rules.append((f'_forbidden{g_id}', f'_advance{g_id}',
+                          self._advance_returns(g)))
+        if self.p.mode != 'array':
+            # Only the plain array sweep has a meaningful "test every rule
+            # at every index" reading; the worklist modes order indices by
+            # their own structure, so fall back to separate loops.
+            out: List[str] = []
+            for g in group:
+                g_id = g._codegen_id
+                out += self._emit_fixpoint_loop(
+                    f'_forbidden{g_id}', f'_advance{g_id}',
+                    g.guard_pick_var is not None, indent,
+                    indices=g.guard_index, returns=self._advance_returns(g))
+            return out
+        out = [f'{indent}{{',
+               f'{indent}  boolean changed = true;',
+               f'{indent}  while (changed) {{',
+               f'{indent}    changed = false;']
+        depth = len(indices)
+        rl = list(group[0].guard_ranges) if group[0].guard_ranges else [None] * depth
+        for d, var in enumerate(indices):
+            pad = '    ' + '  ' * d
+            out.append(self._loop_header(var, rl[d], indent + pad))
+        inner = '    ' + '  ' * depth
+        for fname, aname, returns in rules:
+            out.append(f'{indent}{inner}if ({fname}({call_args})) {{')
+            out.append(f'{indent}{inner}  {set_fields} '
+                       f'{self._advance_call(aname, returns)}')
+            out.append(f'{indent}{inner}  changed = true;')
+            out.append(f'{indent}{inner}}}')
+        for d in range(depth - 1, -1, -1):
+            pad = '    ' + '  ' * d
+            out.append(f'{indent}{pad}}}')
+        out.append(f'{indent}  }}')
+        out.append(f'{indent}}}')
         return out
 
     def emit_main(self) -> List[str]:
@@ -5655,6 +7531,48 @@ class CodeGen:
             out.append('    ' + _java_print_stmt('result', rt))
         out.append('  }')
         return out
+
+    def _splits_at_mid_plus_one(self) -> bool:
+        """True if the program recurses on a `mid + 1` lower bound.
+
+        Distinguishes an inclusive `high` from an exclusive one for the
+        synthesized main: a half-open split recurses on (low, mid) and
+        (mid, high); a closed one needs (mid + 1, high).  Only consulted
+        when the aux-method signal above is absent.
+        """
+        found = [False]
+
+        def walk(st):
+            if st is None or found[0] or not hasattr(st, 'kind'):
+                return
+            for e in (list(getattr(st, 'call_args', None) or [])
+                      + ([st.rhs] if getattr(st, 'rhs', None) is not None else [])
+                      + ([st.decl_init] if getattr(st, 'decl_init', None) is not None else [])
+                      + ([st.return_value] if getattr(st, 'return_value', None) is not None else [])):
+                scan(e)
+            for f in ('body', 'then_stmts', 'else_stmts', 'par_branches'):
+                for t in getattr(st, f, None) or []:
+                    walk(t)
+
+        def scan(e):
+            if e is None or found[0] or not hasattr(e, 'kind'):
+                return
+            if e.kind == 'call' and e.name == self.p.name:
+                for a in e.args:
+                    if (getattr(a, 'kind', None) == 'bin' and a.op == '+'
+                            and getattr(a.lhs, 'name', None) == 'mid'
+                            and getattr(a.rhs, 'value', None) == 1):
+                        found[0] = True; return
+            for f in ('lhs', 'rhs', 'idx', 'idx2'):
+                scan(getattr(e, f, None))
+            for a in getattr(e, 'args', None) or []:
+                scan(a)
+
+        for st in self.p.stmts:
+            walk(st)
+        if self.p.trailing_return is not None:
+            walk(self.p.trailing_return)
+        return found[0]
 
     def _synthesize_main_inputs(self):
         """Return ([decl_lines], [arg_exprs]) or None.
@@ -5769,6 +7687,19 @@ class CodeGen:
             # fixed by making successive 2D int arrays in the same
             # parameter list rotate opposite ways.
             step = -1 if reverse else 1
+            if self.p.base == 1:
+                # setBase(1): slot 0 is unused in both dimensions and the
+                # values are 1..n-1, because 0 is the book's `null` there
+                # (LLP-StableMarriage tests partner[z] != 0). A 0-based
+                # literal would hand such a program a woman numbered 0,
+                # indistinguishable from unmatched.
+                m = n - 1
+                rows = ['{' + ', '.join(['0'] * n) + '}']
+                for i in range(1, n):
+                    vals = ['0'] + [str(((i - 1 + step * k) % m) + 1)
+                                    for k in range(m)]
+                    rows.append('{' + ', '.join(vals) + '}')
+                return '{' + ', '.join(rows) + '}'
             rows = ', '.join(
                 '{' + ', '.join(str((i + step * k) % n) for k in range(n)) + '}'
                 for i in range(n))
@@ -5829,34 +7760,84 @@ class CodeGen:
             if not ty.is_array and not ty.is_2d:
                 # Scalar.
                 if ty.base == 'int':
-                    if name == 'lo' or name == 'low':
+                    # `left`/`right` are the same pair of range bounds as
+                    # `low`/`high`, under the names the book's Algorithm
+                    # CountingInversions uses. Without them both fall
+                    # through to the 0 default, and the synthesized main
+                    # calls CountInversions(A, 0, 0) -- a degenerate range
+                    # that returns 0 and exercises nothing (confirmed).
+                    # The only other left/right in the corpus are locals
+                    # inside Heap.llp, not entry parameters, so this rule
+                    # reaches exactly the one program.
+                    if name in ('lo', 'low', 'left'):
                         args.append('0'); continue
                     if name == 'hi' and first_int_arr:
                         args.append(f'{first_int_arr.name}.length - 1'); continue
-                    if name == 'high' and first_int_arr:
+                    if name in ('high', 'right') and first_int_arr:
                         # Two incompatible conventions share this name in
-                        # this corpus: BinarySearch/ThreeWayPartition treat
-                        # it as exclusive (one past the last valid index,
-                        # `high=A.length`, confirmed to run correctly);
-                        # MergeSort/CountingInversions treat it as
-                        # inclusive (the last valid index, needing
-                        # `A.length - 1` -- `A.length` crashed both).
+                        # this corpus: ThreeWayPartition treats it as
+                        # exclusive (one past the last valid index,
+                        # `high=A.length`); MergeSort/CountingInversions/
+                        # BinarySearch treat it as inclusive (the last valid
+                        # index, needing `A.length - 1`).  BinarySearch was
+                        # previously classified exclusive and only appeared
+                        # to work: with `high=A.length` a key larger than
+                        # every element walks off the end (verified -- it
+                        # throws ArrayIndexOutOfBounds), and the synthesized
+                        # main merely happened to search for a key that is
+                        # present.
                         # The two inclusive cases both also declare an aux
                         # method (Merge/mergeAndCount) that takes its own
                         # `high` parameter alongside a `mid`; neither
                         # exclusive case has any aux method at all. That
                         # co-occurrence is a reliable, corpus-wide way to
                         # tell which convention a given program uses.
+                        # `right` is tested the same way and for the same
+                        # reason: CountingInversions' MergeAndCount takes
+                        # its own `right` alongside `mid`.
                         has_aux_high = any(
-                            any(ap.name == 'high' for ap in m.params)
+                            any(ap.name in ('high', 'right') for ap in m.params)
                             for m in self.p.aux_methods)
+                        # Second signal, for a program whose merge step is a
+                        # SIBLING program rather than an aux method (MergeSort
+                        # calling MergeTwo): a divide-and-conquer that recurses
+                        # on (low, mid) and (mid + 1, high) only makes sense
+                        # with an inclusive high -- an exclusive one would
+                        # split at (low, mid) and (mid, high), with no `+ 1`.
+                        if not has_aux_high:
+                            has_aux_high = self._splits_at_mid_plus_one()
                         if has_aux_high:
                             args.append(f'{first_int_arr.name}.length - 1'); continue
                         args.append(f'{first_int_arr.name}.length'); continue
                     if name == 'n' and first_int_arr:
                         args.append(f'{first_int_arr.name}.length'); continue
+                    if name in ('nr', 'nR', 'nL', 'nc'):
+                        # Size of the OTHER side of a bipartite graph. Left at
+                        # the 0 default it is not merely a poor example: adj
+                        # holds indices 0..7 into that side, so every
+                        # generated main indexed a zero-length array and died
+                        # (SeqAugmentingPath and VertexCoverFromMatching, in
+                        # all three languages).
+                        first2d = next((q for q in self.p.params
+                                        if q.type.is_2d), None)
+                        if first2d is not None:
+                            args.append(f'{first2d.name}.length'); continue
                     if name == 'src' or name == 'source':
                         args.append('0'); continue
+                    if name in ('aux', 'target') and any(
+                            q.name in ('src', 'source') for q in self.p.params):
+                        # Towers-of-Hanoi style peg triple
+                        # (source, aux, target). These are LABELS, not
+                        # sizes or indices, and the only thing that makes
+                        # the output readable is that the three differ:
+                        # left at the 0 default alongside `source` = 0,
+                        # Hanoi's synthesized main printed seven moves
+                        # that all read "peg 0 -> peg 0".
+                        # Gated on a sibling parameter actually named
+                        # `source`, because `target` alone means something
+                        # else entirely -- PairSum(A, target) searches for
+                        # a SUM, and 2 must not leak into it.
+                        args.append('1' if name == 'aux' else '2'); continue
                     if name == 's':
                         args.append('0'); continue
                     if name == 't' and len(self.p.params) >= 2:
@@ -5996,7 +7977,26 @@ class CodeGen:
                         # the end of j's own preference list within 2
                         # rounds (LLPStableMarriage), something no all-zero
                         # start ever did in randomized testing.
-                        lit = '{' + ', '.join(['0'] * shared_n) + '}'
+                        #
+                        # LLP-StableMarriage-Spec is the exception, and it
+                        # is the book that makes it one: its G[j] is a
+                        # POSITION counted from 1, not a 0-based index, so
+                        # its lattice bottom is the book's standard
+                        # initialization [1, 1, ..., 1] -- every man on his
+                        # first choice. Zero is not a position there, and
+                        # mpref[j][G[j]-1] would index -1. AlgorithmGamma
+                        # and LLPBetaStableMarriage keep the 0-based form;
+                        # neither appears in the book.
+                        bottom = ('1' if self.p.name == 'LLPStableMarriageSpec'
+                                  else '0')
+                        vals = [bottom] * shared_n
+                        if self.p.base == 1:
+                            # Slot 0 is the unused sentinel under setBase(1);
+                            # leaving it at the lattice bottom keeps the
+                            # returned vector identical to the sibling
+                            # program's, which never writes slot 0 at all.
+                            vals[0] = '0'
+                        lit = '{' + ', '.join(vals) + '}'
                     else:
                         lit = int_array_defaults[
                             min(int_array_idx, len(int_array_defaults) - 1)]
@@ -6571,18 +8571,28 @@ def main():
         f.write(java)
     print(f'wrote {out_path}')
     # A message program is only half a program without the runtime it extends,
-    # so put a copy where javac will look for it: beside the output.
+    # so put copies where javac will look for them: beside the output.
+    # LLSystem.java is the distributed book's half of that runtime (it supplies
+    # LLSystem.run/options and MutexMonitor); it lives beside the .llp sources
+    # rather than next to this file, so look in both places.  Absent, it is
+    # simply skipped, which is what the sequential corpus wants.
     if 'extends LLProcess' in java:
-        rt_src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              'LLProcess.java')
-        rt_dst = os.path.join(out_dir, 'LLProcess.java')
-        if os.path.exists(rt_src) and not os.path.samefile(
-                os.path.dirname(rt_src) or '.', out_dir or '.'):
-            with open(rt_src) as f:
-                rt = f.read()
-            if not (os.path.exists(rt_dst) and open(rt_dst).read() == rt):
-                with open(rt_dst, 'w') as f:
-                    f.write(rt)
+        search_dirs = [os.path.dirname(os.path.abspath(__file__)), out_dir]
+        for runtime_name in ('LLProcess.java', 'LLSystem.java'):
+            rt_dst = os.path.join(out_dir, runtime_name)
+            for d in search_dirs:
+                rt_src = os.path.join(d, runtime_name)
+                if not os.path.exists(rt_src):
+                    continue
+                if os.path.samefile(os.path.dirname(rt_src) or '.',
+                                    out_dir or '.'):
+                    break
+                with open(rt_src) as f:
+                    rt = f.read()
+                if not (os.path.exists(rt_dst) and open(rt_dst).read() == rt):
+                    with open(rt_dst, 'w') as f:
+                        f.write(rt)
+                break
 
 
 if __name__ == '__main__':

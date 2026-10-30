@@ -100,6 +100,10 @@ def expr_to_js(e: Expr, ctx: 'EmitContext') -> str:
             shifted = str(idx.value - 1)
             return f'{ctx.id_to_js(e.name)}[{shifted}]'
         return f'{ctx.id_to_js(e.name)}[{expr_to_js(idx, ctx)}]'
+    if k == 'slice':
+        # a[lo..hi] is inclusive of hi; JS slice's end is not, hence +1.
+        return (f'{e.name}.slice({expr_to_js(e.slice_lo, ctx)}, '
+                f'({expr_to_js(e.slice_hi, ctx)}) + 1)')
     if k == 'index2':
         def _emit_idx(x):
             if (not ctx.one_indexed) and x.kind == 'int' and x.value >= 1:
@@ -110,6 +114,23 @@ def expr_to_js(e: Expr, ctx: 'EmitContext') -> str:
     if k == 'method_call':
         if e.name == 'clone':
             return ''  # consumed at the decl-init site (see _emit_buildState)
+        # list<T>: LL spells these the way the book does; a JS array has the
+        # same operations under different names.  Same mapping as
+        # llcjssrc.py's _method_call, so the two JS outputs agree.
+        recv = expr_to_js(e.lhs, ctx)
+        args = [expr_to_js(a, ctx) for a in e.args]
+        if e.name == 'add' and len(args) == 1:
+            return f'{recv}.push({args[0]})'
+        if e.name == 'removeFirst' and not args:
+            return f'{recv}.shift()'
+        if e.name == 'removeLast' and not args:
+            return f'{recv}.pop()'
+        if e.name == 'first' and not args:
+            return f'{recv}[0]'
+        if e.name == 'isEmpty' and not args:
+            return f'({recv}.length === 0)'
+        if e.name in ('size', 'length') and not args:
+            return f'{recv}.length'
         raise NotImplementedError(f'method_call {e.name!r} not supported in JS emit')
     if k == 'call':
         args = [expr_to_js(a, ctx) for a in e.args]
@@ -136,6 +157,14 @@ def expr_to_js(e: Expr, ctx: 'EmitContext') -> str:
             # here (a `set<int>` param, or a quantifier range), so this is
             # just Array.includes, not an infix operator.
             return f'{expr_to_js(e.rhs, ctx)}.includes({expr_to_js(e.lhs, ctx)})'
+        if e.op == '/':
+            # LL's `/` is Java integer division. JSEmitter._jx already
+            # truncates; this emitter (the one that writes a mount demo's
+            # forbidden/advance) did not, so an advance that steps to the
+            # next multiple landed between multiples and the fixpoint was
+            # never reached -- LCM1, ParCRT and ParQuadCRT all ran past
+            # llp.js's 100000-step cap on their own default inputs.
+            return f'Math.trunc({expr_to_js(e.lhs, ctx)} / {expr_to_js(e.rhs, ctx)})'
         op = JS_BIN.get(e.op)
         if op is None:
             raise NotImplementedError(f'binary operator {e.op!r}')
@@ -222,6 +251,19 @@ def _render_reduction_quant(e: Expr, ctx: EmitContext) -> str:
                  f'if (__found === undefined) throw new Error('
                  f'\'no {qvar} satisfies the max predicate\'); return __found; }})()')
     header = _quant_header(e.q_var, e.q_lo, e.q_hi, e.q_set, ctx)
+    # `where PRED` restricts the range; an empty selection falls through to
+    # the identity seeded below, matching llc.py.
+    guard = ('' if getattr(e, 'q_where', None) is None
+             else f'if (!({expr_to_js(e.q_where, ctx)})) continue; ')
+    if e.quant in ('argmin', 'argmax'):
+        # The running best INDEX is the result; -1 when nothing is selected.
+        init = 'Infinity' if e.quant == 'argmin' else '-Infinity'
+        cmp = '<' if e.quant == 'argmin' else '>'
+        return (
+            f'(() => {{ let __best = {init}, __arg = -1; {header} {{ {guard}'
+            f'const __v = {body_js}; if (__v {cmp} __best) {{ __best = __v; '
+            f'__arg = {e.q_var}; }} }} return __arg; }})()'
+        )
     if e.quant == 'min':
         init, update = 'Infinity', 'if (__v < __acc) __acc = __v;'
     elif e.quant == 'max':
@@ -231,7 +273,7 @@ def _render_reduction_quant(e: Expr, ctx: EmitContext) -> str:
     else:  # 'count'
         init, update = '0', 'if (__v) __acc += 1;'
     return (
-        f'(() => {{ let __acc = {init}; {header} {{ '
+        f'(() => {{ let __acc = {init}; {header} {{ {guard}'
         f'const __v = {body_js}; {update} }} return __acc; }})()'
     )
 
@@ -307,6 +349,17 @@ def stmt_to_js(s: Stmt, ctx: 'EmitContext', indent: str = '    ',
         if s.return_value is None:
             return [f'{indent}return;']
         return [f'{indent}return {expr_to_js(s.return_value, ctx)};']
+    if k == 'slice_assign':
+        # D[lo..hi] = SRC -> splice SRC's elements into D in place, so the
+        # array object the demo is rendering is mutated, not replaced.
+        lo, hi = expr_to_js(s.slice_lo, ctx), expr_to_js(s.slice_hi, ctx)
+        src = s.rhs
+        if src is not None and src.kind == 'slice':
+            src_js = (f'{src.name}.slice({expr_to_js(src.slice_lo, ctx)}, '
+                      f'({expr_to_js(src.slice_hi, ctx)}) + 1)')
+        else:
+            src_js = expr_to_js(src, ctx)
+        return [f'{indent}{s.lhs_name}.splice({lo}, ({hi}) - ({lo}) + 1, ...{src_js});']
     if k == 'call':
         args = [expr_to_js(a, ctx) for a in s.call_args]
         if s.call_name in ctx.aux_names:
@@ -316,7 +369,7 @@ def stmt_to_js(s: Stmt, ctx: 'EmitContext', indent: str = '    ',
 
 
 def _zero_js(t: 'Type') -> str:
-    if t.is_2d or t.is_array:
+    if t.is_2d or t.is_array or getattr(t, 'is_list', False):
         return '[]'
     if t.base == 'boolean':
         return 'false'
@@ -326,6 +379,12 @@ def _zero_js(t: 'Type') -> str:
 # ============================================================
 #  EmitContext — holds the name->JS mappings during translation
 # ============================================================
+
+def _short(js: str, n: int = 40) -> str:
+    """A short label for a statement in the step list."""
+    js = ' '.join(js.split())
+    return js if len(js) <= n else js[:n - 1] + '\u2026'
+
 
 class EmitContext:
     """Tracks how each LL identifier should be rendered in JS."""
@@ -634,7 +693,15 @@ class JSEmitter:
         self.sc = sidecar
         self.src_basename = src_basename
         self.src_text = src_text
-        self.one_indexed = bool(sidecar.get('one_indexed', False))
+        # `setBase(1)` in the .llp IS the program's statement that it is
+        # 1-indexed, so default to it; the sidecar still wins when present,
+        # including an explicit `"one_indexed": false`. Previously this read
+        # the sidecar alone, so a setBase(1) program without one (and every
+        # program compiled through the LL Playground, which passes {}) was
+        # emitted as 0-indexed: `min t in [1..n]` became
+        # `for (t = 0; t < n; t++)`, skipping index n and visiting the
+        # unused 0 slot, silently and with no error.
+        self.one_indexed = bool(sidecar.get('one_indexed', prog.base == 1))
         self.aux_names = {m.name for m in prog.aux_methods}
         self.guards = [s for s in prog.stmts if s.kind == 'guard']
         if len(self.guards) != 1:
@@ -893,7 +960,11 @@ class JSEmitter:
                 aux_ctx.bind(p.name, 'param', p.name)
             implicit = [name for name in entry_names
                         if name not in own_names and name not in own_top_level_decls]
-            if 'n' not in own_top_level_decls:
+            # `n` may already be in `implicit` when the entry method takes a
+            # parameter literally named `n` (e.g. LLPHornSAT's explicit
+            # variable count), which would emit `const { n, n } = ctx;` --
+            # the same SyntaxError the `G` guard above avoids.
+            if 'n' not in own_top_level_decls and 'n' not in implicit:
                 implicit.append('n')
             params_js = ', '.join([p.name for p in m.params] + ['ctx'])
             out.append(f'function {m.name}({params_js}) {{')
@@ -920,18 +991,52 @@ class JSEmitter:
             if self.one_indexed:
                 # In 1-indexed mode the renderer also asks about cell 0
                 # (the sentinel slot G[0]); short-circuit it as not-forbidden.
-                body_lines = ['    if (j === 0) return false;'] + body_lines
+                # Name the guard's OWN index: `forbidden (i) : ...` emits a
+                # method taking i, and a hardcoded `j` was a free variable
+                # there -- a ReferenceError on the first call.
+                gi = (self.guard.guard_index or ['j'])
+                jn0 = gi[0] if len(gi) == 1 else 'j'
+                body_lines = [f'    if ({jn0} === 0) return false;'] + body_lines
+            always_fb = []
+            for _at, _an, _ae in (getattr(self.guard, 'guard_always', None) or []):
+                always_fb.append(f'    let {_an} = {expr_to_js(_ae, ctx)};')
+            # The slot-0 short-circuit has to come FIRST: an `always`
+            # binding reads the state arrays, and in 1-indexed mode row 0
+            # is the unused sentinel (null in the demo's buildState), so
+            # evaluating it for cell 0 dereferences null.
+            if always_fb and body_lines and body_lines[0].lstrip().startswith('if (') \
+                    and '=== 0) return false;' in body_lines[0]:
+                body_lines = [body_lines[0]] + always_fb + body_lines[1:]
+            else:
+                body_lines = always_fb + body_lines
             forbidden_body = '\n'.join(body_lines)
-            if self.prog.mode == 'heap':
+            if self.prog.mode in ('heap', 'priority'):
+                # Both orderings reduce to the same thing in the browser: scan
+                # the domain, keep what the guard still marks forbidden, and
+                # return the extremal one by the declared key. For 'priority'
+                # that IS the semantics; for 'heap' it is the decrease-key-free
+                # equivalent (see _render_priority_next_index).
                 next_block = self._render_priority_next_index(ctx)
             elif self.prog.mode != 'array':
                 raise NotImplementedError(
-                    f'setMode {self.prog.mode!r} not supported by the JS emitter '
-                    f'(only the default array mode and PriorityQueue are)')
+                    f'setContainer {self.prog.mode!r} is not supported by the '
+                    f'JS emitter (only the default, PriorityQueue and '
+                    f'setPriority are)')
             else:
                 next_block = self._render_scheduler()
 
-        advance_body = self._render_advance(ctx)
+        # `always : T v = expr;` bindings. llc.py emits these at the top
+        # of both forbidden() and advance(); without them the demo's guard
+        # reads a free variable -- LLP-StableMarriage's `z` was simply
+        # undefined, a ReferenceError on the first step.
+        def _always_lines(g, ind='    '):
+            out = []
+            for _atype, aname, aexpr in (getattr(g, 'guard_always', None) or []):
+                out.append(f'{ind}let {aname} = {expr_to_js(aexpr, ctx)};')
+            return out
+
+        advance_body = '\n'.join(_always_lines(self.guard)) + ('\n' if (getattr(self.guard, 'guard_always', None) or []) else '')
+        advance_body += self._render_advance(ctx)
         buildState = self._render_buildState()
         aux_methods = self._render_aux_methods()
         program_text = (clean_llp_for_display(self.src_text)
@@ -944,7 +1049,74 @@ class JSEmitter:
         on_terminate = self.sc.get('on_terminate') or self._default_on_terminate()
         container_id = self.sc.get('container_id') or f'demo-{self.prog.name.lower()}'
 
+        # Scalars the entry method computed before G are reachable only
+        # through ctx inside a rule body (see _render_buildState).
+        def _prologue(ind):
+            out = f'{ind}const n = ctx.n;\n'
+            for d in self.pre_array_decls:
+                if d.name != 'n':
+                    out += f'{ind}const {d.name} = ctx.{d.name};\n'
+            return out
+
+        rules = self.guard.guard_group or [self.guard]
+        if len(rules) > 1:
+            # `&&`-joined rules: emit them as a `rules` array, which llp.js
+            # folds back into one dispatching forbidden/advance pair (an
+            # index is forbidden when any rule forbids it, and that rule
+            # supplies the advance).  Each rule's bodies are rendered with
+            # self.guard pointed at it, since _render_advance and the
+            # predicate renderer both read the current guard.
+            saved = self.guard
+            parts = []
+            try:
+                for g in rules:
+                    self.guard = g
+                    fb_lines = render_forbidden_body(g.guard_predicate, ctx)
+                    gidx = (g.guard_index or ['j'])
+                    jn = gidx[0] if len(gidx) == 1 else 'j'
+                    if self.one_indexed:
+                        fb_lines = [f'    if ({jn} === 0) return false;'] + fb_lines
+                    parts.append(
+                        '    {\n'
+                        f'      forbidden({jn}, G, ctx) {{\n'
+                        + _prologue('        ')
+                        + '\n'.join(fb_lines) + '\n'
+                        '      },\n'
+                        f'      advance({jn}, G, ctx) {{\n'
+                        + _prologue('        ')
+                        + self._render_advance(ctx) + '\n'
+                        '      }\n'
+                        '    }')
+            finally:
+                self.guard = saved
+            rules_block = '  rules: [\n' + ',\n'.join(parts) + '\n  ],'
+        else:
+            # The driver passes the index positionally, so name the
+            # parameter after the guard's own index variable -- a guard
+            # written `forbidden (x) : ...` has a body that says `x`, and
+            # a hardcoded `j` leaves those references unbound.
+            idx = (self.guard.guard_index or ['j'])
+            jname = idx[0] if len(idx) == 1 else 'j'
+            rules_block = (
+                f'  forbidden({jname}, G, ctx) {{\n' + _prologue('    ')
+                + forbidden_body + '\n  },\n'
+                f'  advance({jname}, G, ctx) {{\n' + _prologue('    ')
+                + advance_body + '\n  },')
+
+        # Optional sidecar fields. srcName drives the demo's "view source"
+        # links (validate-site.py checks it against code/), and listing
+        # declares how faithfully `program` quotes the .llp -- both were
+        # previously hand-added after generation, which meant regenerating
+        # a demo silently dropped them.
+        src_name = (f"\n  srcName: '{self.sc['src_name']}'," 
+                    if self.sc.get('src_name') else '')
+        listing = (f"\n  listing: '{self.sc['listing']}',"
+                   if self.sc.get('listing') else '')
+
         return JS_TEMPLATE.format(
+            src_name=src_name,
+            listing=listing,
+            rules_block=rules_block,
             src_basename=self.src_basename,
             aux_methods=aux_methods,
             container_id=container_id,
@@ -1042,10 +1214,15 @@ class JSEmitter:
         fresh before every step (mount()'s findForbidden()), so it always
         returns the same vertex a decrease-key heap would have -- including
         when other vertices' priorities changed since the last step, which
-        a real heap would need an explicit decrease-key for anyway. Fine
-        for the small instances these demos run; see the book's own Java
-        backend (llc.py's 'heap' mode) for the real-heap version used when
-        asymptotic efficiency matters."""
+        a real heap would need an explicit decrease-key for anyway.
+
+        llc.py's 'heap' mode now does the same thing for the same reason.
+        It used to seed a java.util.PriorityQueue once and poll it to
+        exhaustion, which orders by the key each element had at insertion
+        and never reconsiders -- wrong for any priority the advance can
+        change. A decrease-key heap would need a dependency list saying
+        which indices to re-key after each advance, and LL has no way to
+        express one, so both backends re-select by scanning."""
         pred = self.guard.guard_predicate
         if self.one_indexed:
             init = 'let j = 1'
@@ -1076,7 +1253,12 @@ class JSEmitter:
             out.extend(render_pick_witness(self.guard.guard_predicate, ctx))
         out.extend(stmt_to_js(self.guard.guard_advance, ctx,
                                terminate_return=True))
-        out.append('    return { step: `advance j=${j}: G ' +
+        # Name the index after the guard's own variable: a guard written
+        # `forbidden (x) : ...` is emitted with `x` as the parameter, so a
+        # hardcoded `j` here is an unbound reference at run time.
+        _gi = (self.guard.guard_index or ['j'])
+        _jn = _gi[0] if len(_gi) == 1 else 'j'
+        out.append('    return { step: `advance ' + _jn + '=${' + _jn + '}: G ' +
                    '${__snapshot}' + ' \u2192 ${JSON.stringify(G)}` };')
         return '\n'.join(out)
 
@@ -1177,7 +1359,11 @@ class JSEmitter:
         # `int n = v[0].length;`) -- then that's the authoritative value
         # (it's what G itself was sized from), and a second `const n =`
         # here would be a duplicate-declaration SyntaxError.
-        if any(d.name == 'n' for d in self.pre_array_decls):
+        # ... or an entry parameter is itself literally named `n` (e.g.
+        # LLPHornSAT's explicit variable count), which already emitted
+        # `const n = inputs.n;` above -- same duplicate-declaration error.
+        if (any(d.name == 'n' for d in self.pre_array_decls)
+                or any(p.name == 'n' for p in self.prog.params)):
             pass
         elif self.G_kind == 'in_place':
             lines.append(f'    const n = {"G.length - 1" if self.one_indexed else "G.length"};')
@@ -1221,9 +1407,19 @@ class JSEmitter:
         # list; appending it again would emit a duplicate object-literal
         # key here and, worse, `const { G, G } = ctx;` -- a SyntaxError --
         # in _render_aux_methods below.)
+        # Program-level scalars computed before G (e.g. `int m = w.length;`,
+        # `int u = S[0].length;`) are in scope inside the entry method, so a
+        # guard body may name them -- put them in ctx, or forbidden/advance
+        # reference an unbound identifier.
+        for d in self.pre_array_decls:
+            if d.name not in ctx_fields:
+                ctx_fields.append(d.name)
         if 'G' not in ctx_fields:
             ctx_fields.append('G')
-        ctx_fields.append('n')
+        # Likewise skipped when an entry param is named `n`: a second entry
+        # would be a duplicate object-literal key.
+        if 'n' not in ctx_fields:
+            ctx_fields.append('n')
         if self.sc.get('scheduler') == 'odd-even':
             ctx_fields.append('__phase')
 
@@ -1329,7 +1525,7 @@ JS_TEMPLATE = """\
 // Do not edit by hand; edit the .llp source and rerun the build.
 
 {aux_methods}LLP.mount(document.getElementById('{container_id}'), {{
-  title: '{title}',
+  title: '{title}',{src_name}{listing}
   program: `\n{program_text}\n`,
   inputs: [
 {inputs_js}
@@ -1337,14 +1533,7 @@ JS_TEMPLATE = """\
   buildState(inputs) {{
 {buildState}
   }},
-  forbidden(j, G, ctx) {{
-    const n = ctx.n;
-{forbidden_body}
-  }},
-  advance(j, G, ctx) {{
-    const n = ctx.n;
-{advance_body}
-  }},
+{rules_block}
   describe(G, ctx) {{
     return `{describe}`;
   }},
@@ -1411,11 +1600,50 @@ class JSImperativeEmitter:
         out.append(f'// Auto-generated from {self.src_basename} by lang/llcjs.py.')
         out.append('// Do not edit by hand; edit the .llp source and rerun the build.')
         out.append('')
+        # Raw JS emitted ahead of the mount call, from the sidecar's
+        # "prologue". This exists for one specific shape: a program that
+        # calls a SIBLING program, which this emitter writes through as
+        # `Sibling.Method(...)` with nothing defining `Sibling` in the
+        # module (Johnson calls Dijkstra). Inlining the sibling properly
+        # would mean teaching this emitter heap<int>, which only
+        # llcjssrc.py knows -- until then the sidecar supplies the
+        # sibling, and the demo stays REGENERABLE instead of being
+        # hand-finished after every build (which is what
+        # ch7-johnson-classical.js used to require, with a comment at the
+        # top asking the next person to re-apply two edits by hand).
+        prologue = self.sc.get('prologue')
+        if prologue:
+            out.append(prologue.rstrip('\n'))
+            out.append('')
         out.append(f"LLP.mountFunction(document.getElementById('{container_id}'), {{")
         out.append(f'  title: {json.dumps(title)},')
+        # SINGLE-quoted, like JSEmitter's template above: companion/
+        # sync-demo-listings.py and validate-site.py both find these with
+        # `srcName:\s*'([^')]+)'`, so a json.dumps() double-quoted spelling
+        # is invisible to them and the demo silently drops out of the
+        # listing sync.
+        if self.sc.get('src_name'):
+            out.append(f"  srcName: '{self.sc['src_name']}',")
+        if self.sc.get('listing'):
+            out.append(f"  listing: '{self.sc['listing']}',")
         out.append(f'  signature: {json.dumps(signature)},')
         if program_text:
             out.append(f'  program: {json.dumps(program_text)},')
+        # Which "view source" links the demo offers. Same sidecar
+        # treatment srcName/listing already get in JSEmitter above, and
+        # for the same reason: these were hand-added after generation, so
+        # regenerating a guard-free demo silently dropped them -- which is
+        # exactly what happened to ch1-hanoi.js, whose srcName/python/js/
+        # cpp flags lived only in the companion copy.
+        for flag in ('python', 'js', 'cpp'):
+            if self.sc.get(flag):
+                out.append(f'  {flag}: true,')
+        # A sibling program this demo's Java download needs alongside it
+        # (llp.js renders the extra link). Same hand-added-then-lost story
+        # as the flags above: ch7-johnson-classical.js carried
+        # javaRequires: 'ch7/Dijkstra' only in the companion copy.
+        if self.sc.get('java_requires'):
+            out.append(f"  javaRequires: '{self.sc['java_requires']}',")
         out.append('  inputs: ' + inputs_decl + ',')
         out.append('  trace(inputs) {')
         out.append('    const steps = [];')
@@ -1563,6 +1791,8 @@ class JSImperativeEmitter:
                     out.extend(self._emit_stmt(t, indent + '  ', set(locals_set), fname))
             out.append(f'{indent}}}')
             return out
+        if k == 'break':
+            return [f'{indent}break;']
         if k == 'while':
             out = [f'{indent}while ({self._jx(s.cond)}) {{', f'{indent}  __tick();']
             for t in s.body:
@@ -1589,9 +1819,27 @@ class JSImperativeEmitter:
                 f'__rec({json.dumps(f"return from {fname} = ")} + JSON.stringify(__r), {{}});'
                 f' return __r; }}'
             ]
+        if k == 'slice_assign':
+            lo, hi = self._jx(s.slice_lo), self._jx(s.slice_hi)
+            src = s.rhs
+            if src is not None and src.kind == 'slice':
+                src_js = (f'{src.name}.slice({self._jx(src.slice_lo)}, '
+                          f'({self._jx(src.slice_hi)}) + 1)')
+            else:
+                src_js = self._jx(src)
+            return [f'{indent}{s.lhs_name}.splice({lo}, ({hi}) - ({lo}) + 1, ...{src_js});']
         if k == 'call':
             args = ', '.join(self._jx(a) for a in s.call_args)
             return [f'{indent}{s.call_name}({args});']
+        if k == 'exprstmt':
+            # A bare expression used as a statement -- in practice a method
+            # call whose effect is the point, e.g. `mList.add(i);` on a
+            # list<T>.  Record a step afterwards so the trace shows the
+            # mutation, the same as an assignment does.
+            frame = '{ ' + ', '.join(sorted(locals_set)) + ' }'
+            expr_js = self._jx(s.rhs if s.rhs is not None else s.cond)
+            return [f'{indent}{expr_js};',
+                    f'{indent}__rec({json.dumps(_short(expr_js))}, {frame});']
         if k == 'swap':
             a = self._jx(s.swap_a); b = self._jx(s.swap_b)
             frame = '{ ' + ', '.join(sorted(locals_set)) + ' }'
@@ -1614,6 +1862,10 @@ class JSImperativeEmitter:
         if k == 'id': return e.name
         if k == 'index':
             return f'{e.name}[{self._jx(e.idx)}]'
+        if k == 'slice':
+            # a[lo..hi] is inclusive of hi; JS slice's end is not, hence +1.
+            return (f'{e.name}.slice({self._jx(e.slice_lo)}, '
+                    f'({self._jx(e.slice_hi)}) + 1)')
         if k == 'index2':
             chain = ''.join(f'[{self._jx(x)}]' for x in [e.idx, e.rhs, *e.idx_extra])
             return f'{e.name}{chain}'
@@ -1642,18 +1894,82 @@ class JSImperativeEmitter:
         if k == 'field_access':
             return f'{self._jx(e.lhs)}.{e.name}'
         if k == 'method_call':
-            args = ', '.join(self._jx(a) for a in e.args)
-            return f'{self._jx(e.lhs)}.{e.name}({args})'
+            # list<T> onto the JS array equivalents -- the same mapping
+            # expr_to_js and llcjssrc.py use, so all three JS paths agree.
+            recv = self._jx(e.lhs)
+            a = [self._jx(x) for x in e.args]
+            if e.name == 'add' and len(a) == 1:      return f'{recv}.push({a[0]})'
+            if e.name == 'removeFirst' and not a:    return f'{recv}.shift()'
+            if e.name == 'removeLast' and not a:     return f'{recv}.pop()'
+            if e.name == 'first' and not a:          return f'{recv}[0]'
+            if e.name == 'isEmpty' and not a:        return f'({recv}.length === 0)'
+            if e.name in ('size', 'length') and not a: return f'{recv}.length'
+            return f'{recv}.{e.name}({", ".join(a)})'
         if k == 'new_array':
             fill = 'false' if e.name == 'boolean' else '0'
             if e.idx2 is None:
                 return f'new Array({self._jx(e.idx)}).fill({fill})'
             sizes = [self._jx(x) for x in [e.idx, e.idx2, *e.idx_extra]]
             return _render_new_array_dims(sizes, fill)
+        if k == 'quant':
+            return self._jx_quant(e)
         raise NotImplementedError(f'imperative emitter: expr kind {k!r}')
 
+    def _jx_quant(self, e: 'Expr') -> str:
+        """A quantifier used as a sub-expression -- `max i in [0..n-1] : f(i)`,
+        `exists k in s : p(k)` -- rendered as a JS IIFE, since JS has no
+        reduction- or quantifier-expression syntax of its own.
+
+        The guard emitter has its own copies of this (_render_reduction_quant
+        and _render_bool_quant). They are not shared: that path renders
+        sub-expressions through expr_to_js/EmitContext and applies a
+        1-based-to-0-based index shift to the loop bounds, neither of which
+        applies here -- this emitter is plainly 0-based (see the 'index' case
+        above) and renders through self._jx.
+        """
+        body = self._jx(e.q_body)
+        where = (None if getattr(e, 'q_where', None) is None
+                 else self._jx(e.q_where))
+        v = e.q_var
+        if e.q_set is not None:
+            header = f'for (const {v} of {self._jx(e.q_set)})'
+        else:
+            lo, hi = self._jx(e.q_lo), self._jx(e.q_hi)
+            header = f'for (let {v} = {lo}; {v} <= {hi}; {v}++)'
+        if where is not None:
+            # exists/forall: a restricted range is the same as conjoining the
+            # predicate (exists) or implying from it (forall).
+            if e.quant == 'exists':
+                body = f'({where}) && ({body})'
+            elif e.quant == 'forall':
+                body = f'!({where}) || ({body})'
+        if e.quant == 'exists':
+            return (f'(() => {{ {header} {{ if ({body}) return true; }} '
+                    f'return false; }})()')
+        if e.quant == 'forall':
+            return (f'(() => {{ {header} {{ if (!({body})) return false; }} '
+                    f'return true; }})()')
+        if e.quant in ('argmin', 'argmax'):
+            init = 'Infinity' if e.quant == 'argmin' else '-Infinity'
+            cmp = '<' if e.quant == 'argmin' else '>'
+            g2 = '' if where is None else f'if (!({where})) continue; '
+            return (f'(() => {{ let __best = {init}, __arg = -1; {header} {{ {g2}'
+                    f'const __v = {body}; if (__v {cmp} __best) {{ __best = __v; '
+                    f'__arg = {v}; }} }} return __arg; }})()')
+        acc = {'min':   ('Infinity',  'if (__v < __acc) __acc = __v;'),
+               'max':   ('-Infinity', 'if (__v > __acc) __acc = __v;'),
+               'sum':   ('0',         '__acc += __v;'),
+               'count': ('0',         'if (__v) __acc += 1;')}.get(e.quant)
+        if acc is None:
+            raise NotImplementedError(
+                f'imperative emitter: quantifier {e.quant!r} as sub-expression')
+        init, upd = acc
+        g = '' if where is None else f'if (!({where})) continue; '
+        return (f'(() => {{ let __acc = {init}; {header} {{ {g}'
+                f'const __v = {body}; {upd} }} return __acc; }})()')
+
     def _zero(self, t: 'Type') -> str:
-        if t.is_2d or t.is_array: return '[]'
+        if t.is_2d or t.is_array or getattr(t, 'is_list', False): return '[]'
         if t.base == 'boolean': return 'false'
         return '0'
 
