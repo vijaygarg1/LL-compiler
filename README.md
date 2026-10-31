@@ -8,19 +8,34 @@ Approach to Parallel Algorithms* (Vijay K. Garg). An LL source file
 interactive browser demos, or a LaTeX `algorithm2e` fragment for the book
 itself.
 
-This repository holds the compiler and its two companion emitters —
+This repository holds the compiler and its companion emitters —
 independent of any particular book's chapter content.
+
+## This repository is frozen
+
+`ll-1.0` is the language exactly as *A Systematic Approach to Algorithms*
+ships it (published 2026-10-28). It is kept frozen so the programs printed
+in that book can always be rebuilt with the compiler that produced them.
+
+**Development continues in `github.com/vijaygarg1/LL2-Compiler`**, which
+starts from this same code. The language stays upward compatible — every
+`.llp` that compiles here compiles there — so the name does not change.
+Nothing but a correctness fix to the 1.0 toolchain should land here.
 
 ## Tools
 
 | Script | Emits | Usage |
 |---|---|---|
 | `llc.py` | Java | `python3 llc.py Prog.llp --out DIR/` |
-| `llcjs.py` | JavaScript (for an `LLP.mount(container, spec)`-style interactive demo) | `python3 llcjs.py Prog.llp --out Prog.js` |
+| `llcpy.py` | Python | `python3 llcpy.py Prog.llp --out DIR/` |
+| `llcjssrc.py` | JavaScript, the plain algorithm | `python3 llcjssrc.py Prog.llp --out DIR/` |
+| `llcjs.py` | JavaScript, an `LLP.mount(container, spec)` interactive demo module | `python3 llcjs.py Prog.llp --out Prog.js` |
 | `llpp.py` | LaTeX (`algorithm2e`, matching the book's `\Forbidden{...}\Advance{...}` macros) | `python3 llpp.py Prog.llp --out Prog.tex` |
 
-All three are plain Python 3 with no external dependencies, and operate on
-the same `.llp` source grammar (see `syntax.md`).
+All five are plain Python 3 with no external dependencies, and operate on
+the same `.llp` source grammar (see `syntax.md`). The two JavaScript
+emitters are different artifacts: one is the algorithm as plain source,
+the other a steppable browser demo.
 
 ### Example
 
